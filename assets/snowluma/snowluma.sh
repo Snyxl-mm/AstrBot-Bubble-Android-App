@@ -16,10 +16,13 @@
 # Ports (mirroring SnowLuma upstream defaults plus the noVNC side):
 #   5099  WebUI      (config/runtime.json -> webuiPort)
 #   6081  noVNC      (QQ window, used for QR scan)
-#   5900  x11vnc     (internal, loopback only)
+#   5900  x11vnc     (noVNC 后端，仅 loopback)
 #   3001  OneBot WS  /  3000 OneBot HTTP (per-UIN, created after QQ login)
 #
+# SNOWLUMA_BIND_HOST 默认 0.0.0.0（与 SnowLuma 官方默认一致，局域网可访问）；
+# 想只允许手机本机访问就设成 127.0.0.1。
 # Environment overrides: SNOWLUMA_VERSION, SNOWLUMA_DIR, SNOWLUMA_RUNTIME_DIR,
+# SNOWLUMA_BIND_HOST,
 # SNOWLUMA_WEBUI_PORT, SNOWLUMA_VNC_PORT, SNOWLUMA_ONEBOT_WS_PORT,
 # SNOWLUMA_ONEBOT_HTTP_PORT, SNOWLUMA_DISPLAY_NUM, SNOWLUMA_GITHUB_PROXY,
 # SNOWLUMA_TARBALL (offline install from a local tarball),
@@ -31,6 +34,7 @@ SL_VERSION="${SNOWLUMA_VERSION:-2.0.3}"
 SL_HOME="${SNOWLUMA_DIR:-$HOME/snowluma}"
 SL_RT="${SNOWLUMA_RUNTIME_DIR:-$HOME/.config/astrbot-android/snowluma}"
 SL_INSTANCE_HOME="${SNOWLUMA_QQ_HOME:-$HOME/snowluma_instances/default_home}"
+SL_BIND_HOST="${SNOWLUMA_BIND_HOST:-0.0.0.0}"
 SL_WEBUI_PORT="${SNOWLUMA_WEBUI_PORT:-5099}"
 SL_VNC_PORT="${SNOWLUMA_VNC_PORT:-6081}"
 SL_VNCSERVER_PORT="${SNOWLUMA_VNCSERVER_PORT:-5900}"
@@ -251,7 +255,8 @@ install_snowluma() {
 
 write_config() {
   mkdir -p "$SL_HOME/config"
-  SNOW_WEBUI_PORT="$SL_WEBUI_PORT" SNOW_WS_PORT="$SL_ONEBOT_WS_PORT" \
+  SNOW_BIND_HOST="$SL_BIND_HOST" \
+    SNOW_WEBUI_PORT="$SL_WEBUI_PORT" SNOW_WS_PORT="$SL_ONEBOT_WS_PORT" \
     SNOW_HTTP_PORT="$SL_ONEBOT_HTTP_PORT" SNOW_TOKEN_FILE="$SL_RT/onebot-token" \
     SNOW_CONFIG_DIR="$SL_HOME/config" "$SL_HOME/node" -e '
 const fs = require("fs");
@@ -263,7 +268,7 @@ const onebotPath = path.join(dir, "onebot.json");
 let runtime = {};
 try { runtime = JSON.parse(fs.readFileSync(runtimePath, "utf8")); } catch {}
 runtime.webuiPort = Number(process.env.SNOW_WEBUI_PORT);
-runtime.webuiHost = runtime.webuiHost || "127.0.0.1";
+runtime.webuiHost = process.env.SNOW_BIND_HOST || runtime.webuiHost || "0.0.0.0";
 runtime.hookAutoLoad = true;
 fs.writeFileSync(runtimePath, JSON.stringify(runtime, null, 2));
 
@@ -274,30 +279,74 @@ if (!token) {
   fs.writeFileSync(process.env.SNOW_TOKEN_FILE, token);
 }
 
-if (!fs.existsSync(onebotPath)) {
-  const adapter = (name, port) => ({
-    name,
-    enabled: true,
-    host: "127.0.0.1",
-    port: Number(port),
-    path: "/",
-    accessToken: token,
-    messageFormat: "array",
-    reportSelfMessage: false,
-  });
-  const config = {
+const bind = process.env.SNOW_BIND_HOST || "0.0.0.0";
+const wantHttpPort = Number(process.env.SNOW_HTTP_PORT);
+const wantWsPort = Number(process.env.SNOW_WS_PORT);
+
+const adapter = (name, port) => ({
+  name,
+  enabled: true,
+  host: bind,
+  port: Number(port),
+  path: "/",
+  accessToken: token,
+  messageFormat: "array",
+  reportSelfMessage: false,
+});
+
+let onebot = null;
+try { onebot = JSON.parse(fs.readFileSync(onebotPath, "utf8")); } catch {}
+
+if (!onebot) {
+  onebot = {
     networks: {
-      httpServers: [adapter("http-default", process.env.SNOW_HTTP_PORT)],
+      httpServers: [adapter("http-default", wantHttpPort)],
       httpClients: [],
-      wsServers: [{ ...adapter("ws-default", process.env.SNOW_WS_PORT), role: "Universal" }],
+      wsServers: [{ ...adapter("ws-default", wantWsPort), role: "Universal" }],
       wsClients: [],
     },
     musicSignUrl: "",
   };
-  fs.writeFileSync(onebotPath, JSON.stringify(config, null, 2));
+} else {
+  // 已存在：只对齐监听地址/端口，保留用户原有 token、上报端点与其他设置
+  const nets = onebot.networks || (onebot.networks = {});
+  for (const list of [nets.httpServers, nets.wsServers]) {
+    for (const item of list || []) {
+      if (item && typeof item === "object") item.host = bind;
+    }
+  }
+  const http0 = (nets.httpServers || [])[0];
+  if (http0) http0.port = wantHttpPort;
+  const ws0 = (nets.wsServers || [])[0];
+  if (ws0) ws0.port = wantWsPort;
 }
+fs.writeFileSync(onebotPath, JSON.stringify(onebot, null, 2));
+
+// 账号级配置（config/onebot_<uin>.json）会覆盖全局默认，登录后由 SnowLuma 生成，
+// 这里一并把监听地址/端口对齐，改 bind host 或端口后重启即可全部生效。
+const accountFiles = fs.readdirSync(dir).filter(
+  (f) => /^onebot_\d+\.json$/.test(f),
+);
+for (const f of accountFiles) {
+  const fp = path.join(dir, f);
+  let cfg;
+  try { cfg = JSON.parse(fs.readFileSync(fp, "utf8")); } catch { continue; }
+  const nets = cfg.networks || {};
+  for (const list of [nets.httpServers, nets.wsServers]) {
+    for (const item of list || []) {
+      if (item && typeof item === "object") item.host = bind;
+    }
+  }
+  const h0 = (nets.httpServers || [])[0];
+  if (h0) h0.port = wantHttpPort;
+  const w0 = (nets.wsServers || [])[0];
+  if (w0) w0.port = wantWsPort;
+  fs.writeFileSync(fp, JSON.stringify(cfg, null, 2));
+  console.log("patched account config: " + f);
+}
+console.log("onebot bind=" + bind + " http=" + wantHttpPort + " ws=" + wantWsPort);
 ' || { warn "写入 SnowLuma 配置失败"; return 1; }
-  log "WebUI 端口 $SL_WEBUI_PORT / OneBot WS $SL_ONEBOT_WS_PORT / OneBot HTTP $SL_ONEBOT_HTTP_PORT"
+  log "监听 $SL_BIND_HOST — WebUI $SL_WEBUI_PORT / OneBot WS $SL_ONEBOT_WS_PORT / OneBot HTTP $SL_ONEBOT_HTTP_PORT"
 }
 
 # QQ silently hot-patches itself, which breaks version-matched native hooks.
@@ -364,7 +413,8 @@ start_vnc() {
     mkdir -p "$HOME/.vnc"
     [ -f "$HOME/.vnc/passwd" ] || x11vnc -storepasswd snowluma "$HOME/.vnc/passwd" >/dev/null 2>&1
     nohup x11vnc -display ":$SL_DISPLAY_NUM" -noshm -rfbauth "$HOME/.vnc/passwd" \
-      -forever -shared -rfbport "$SL_VNCSERVER_PORT" -o "$SL_LOG_DIR/x11vnc.log" \
+      -forever -shared -listen 127.0.0.1 -rfbport "$SL_VNCSERVER_PORT" \
+      -o "$SL_LOG_DIR/x11vnc.log" \
       > /dev/null 2>&1 &
     record_pid x11vnc "$!"
     sleep 2
@@ -515,6 +565,7 @@ cmd_status() {
   printf 'qq_running=%s\n' "$qq_up"
   printf 'version=%s\n' "$SL_VERSION"
   printf 'home=%s\n' "$SL_HOME"
+  printf 'bind_host=%s\n' "$SL_BIND_HOST"
   printf 'webui_port=%s\n' "$SL_WEBUI_PORT"
   printf 'vnc_port=%s\n' "$SL_VNC_PORT"
   printf 'onebot_ws_port=%s\n' "$SL_ONEBOT_WS_PORT"
