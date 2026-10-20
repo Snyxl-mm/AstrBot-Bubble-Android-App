@@ -1124,6 +1124,34 @@ class _WebViewPageState extends State<WebViewPage> {
       );
     }
 
+    if (homeController.isSnowLumaInstalled.value &&
+        !hidden.contains('snowluma')) {
+      final url = ServicePorts.snowLumaWebUiUrl;
+      targets.add(
+        _WebUiTarget(
+          id: 'snowluma',
+          title: 'SnowLuma',
+          icon: Icons.cable,
+          url: url,
+          controller: _getCustomController(url),
+        ),
+      );
+    }
+
+    if (homeController.isSnowLumaInstalled.value &&
+        !hidden.contains('snowluma-vnc')) {
+      final url = ServicePorts.snowLumaVncUrl;
+      targets.add(
+        _WebUiTarget(
+          id: 'snowluma-vnc',
+          title: 'SnowLuma 扫码',
+          icon: Icons.qr_code_2,
+          url: url,
+          controller: _getCustomController(url),
+        ),
+      );
+    }
+
     for (final instance in homeController.napCatInstances) {
       final id = 'napcat:${instance['id'] ?? ''}';
       if (hidden.contains(id)) continue;
@@ -1432,6 +1460,8 @@ class _WebViewPageState extends State<WebViewPage> {
       return;
     }
     if (target.id == 'opencode' ||
+        target.id == 'snowluma' ||
+        target.id == 'snowluma-vnc' ||
         target.id.startsWith('napcat:') ||
         target.customWebViewIndex != null) {
       final controller = _customControllers.remove(target.url);

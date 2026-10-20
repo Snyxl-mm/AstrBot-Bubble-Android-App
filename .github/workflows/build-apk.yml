@@ -1,0 +1,119 @@
+name: Build APK
+
+# 手机端（arm64 容器）无法构建 Flutter APK：Flutter 官方不发布 linux-arm64 host
+# SDK，Android SDK 的 aapt2/build-tools 也只有 x86_64，且容器没有 binfmt_misc 与
+# CAP_SYS_ADMIN，x86_64 子进程无法 exec。所以 APK 在这里（GitHub 托管 runner，x64）
+# 构建，产物直接作为 artifact 下载即可安装。
+on:
+  workflow_dispatch:
+    inputs:
+      build_mode:
+        description: '构建模式'
+        required: true
+        default: 'release'
+        type: choice
+        options:
+          - release
+          - debug
+      flutter_version:
+        description: 'Flutter 版本（留空用 stable 最新）'
+        required: false
+        default: ''
+  push:
+    branches: [master, main]
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ inputs.flutter_version }}
+          cache: true
+
+      - name: Toolchain info
+        run: |
+          flutter --version
+          java -version
+          echo "ARCH=$(uname -m)  CORES=$(nproc)"
+
+      # 可选：配置 release 签名。在仓库 Settings → Secrets 里放好
+      # KEYSTORE_BASE64 / STORE_PASSWORD / KEY_PASSWORD / KEY_ALIAS 即生效；
+      # 不配置时 build.gradle 会自动回退到 debug 签名，APK 依然可直接安装。
+      - name: Prepare release keystore
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          STORE_PASSWORD: ${{ secrets.STORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+        run: |
+          if [ -n "${KEYSTORE_BASE64}" ]; then
+            echo "配置 release 签名"
+            echo "${KEYSTORE_BASE64}" | base64 -d > android/app/release.jks
+            cat > android/key.properties <<EOF
+          storePassword=${STORE_PASSWORD}
+          keyPassword=${KEY_PASSWORD}
+          keyAlias=${KEY_ALIAS}
+          storeFile=release.jks
+          EOF
+          else
+            echo "未配置 keystore，回退 debug 签名"
+          fi
+
+      - name: Pub get
+        run: flutter pub get
+
+      - name: Analyze (non-blocking)
+        continue-on-error: true
+        run: flutter analyze
+
+      - name: Build APK
+        run: |
+          MODE="${{ inputs.build_mode }}"
+          [ -z "$MODE" ] && MODE=release
+          echo "构建模式: $MODE"
+          if [ "$MODE" = "debug" ]; then
+            flutter build apk --debug
+          else
+            flutter build apk --release
+          fi
+
+      - name: Collect artifacts
+        run: |
+          mkdir -p dist
+          cp build/app/outputs/flutter-apk/*.apk dist/ 2>/dev/null || true
+          ls -lh dist
+          sha256sum dist/*.apk > dist/SHA256SUMS.txt || true
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: astrbot-bubble-apk-${{ github.sha }}
+          path: |
+            dist/*.apk
+            dist/SHA256SUMS.txt
+          retention-days: 30
+
+      - name: Attach to release (tags only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.apk
+          generate_release_notes: true

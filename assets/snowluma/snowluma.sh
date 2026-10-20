@@ -1,0 +1,578 @@
+#!/usr/bin/env bash
+# SnowLuma controller for AstrBot Android (proot Ubuntu rootfs).
+#
+# Managed by the AstrBot Bubble app, but every subcommand is safe to run by
+# hand from the app terminal:
+#
+#   bash snowluma.sh install     # deps + download + unpack + config
+#   bash snowluma.sh start       # Xvfb + fluxbox + x11vnc + noVNC + SnowLuma
+#   bash snowluma.sh stop
+#   bash snowluma.sh restart
+#   bash snowluma.sh status      # key=value lines, parsed by the app
+#   bash snowluma.sh qq          # launch a dedicated QQ instance (scan login)
+#   bash snowluma.sh vnc         # restart only the noVNC side
+#   bash snowluma.sh uninstall [--clean-data]
+#
+# Ports (mirroring SnowLuma upstream defaults plus the noVNC side):
+#   5099  WebUI      (config/runtime.json -> webuiPort)
+#   6081  noVNC      (QQ window, used for QR scan)
+#   5900  x11vnc     (internal, loopback only)
+#   3001  OneBot WS  /  3000 OneBot HTTP (per-UIN, created after QQ login)
+#
+# Environment overrides: SNOWLUMA_VERSION, SNOWLUMA_DIR, SNOWLUMA_RUNTIME_DIR,
+# SNOWLUMA_WEBUI_PORT, SNOWLUMA_VNC_PORT, SNOWLUMA_ONEBOT_WS_PORT,
+# SNOWLUMA_ONEBOT_HTTP_PORT, SNOWLUMA_DISPLAY_NUM, SNOWLUMA_GITHUB_PROXY,
+# SNOWLUMA_TARBALL (offline install from a local tarball),
+# SNOWLUMA_QQ_HOME (per-instance QQ HOME), SNOWLUMA_HOOK_MODE.
+
+set -o pipefail
+
+SL_VERSION="${SNOWLUMA_VERSION:-2.0.3}"
+SL_HOME="${SNOWLUMA_DIR:-$HOME/snowluma}"
+SL_RT="${SNOWLUMA_RUNTIME_DIR:-$HOME/.config/astrbot-android/snowluma}"
+SL_INSTANCE_HOME="${SNOWLUMA_QQ_HOME:-$HOME/snowluma_instances/default_home}"
+SL_WEBUI_PORT="${SNOWLUMA_WEBUI_PORT:-5099}"
+SL_VNC_PORT="${SNOWLUMA_VNC_PORT:-6081}"
+SL_VNCSERVER_PORT="${SNOWLUMA_VNCSERVER_PORT:-5900}"
+SL_ONEBOT_WS_PORT="${SNOWLUMA_ONEBOT_WS_PORT:-3001}"
+SL_ONEBOT_HTTP_PORT="${SNOWLUMA_ONEBOT_HTTP_PORT:-3000}"
+SL_DISPLAY_NUM="${SNOWLUMA_DISPLAY_NUM:-21}"
+SL_SCREEN="${SNOWLUMA_SCREEN:-1280x720x24}"
+SL_PROXY_CFG="${SNOWLUMA_GITHUB_PROXY:-auto}"
+SL_TARBALL="${SNOWLUMA_TARBALL:-}"
+SL_ARCHIVE=""
+SL_HOOK_MODE="${SNOWLUMA_HOOK_MODE:-auto}"
+SL_RUN_DIR="$SL_RT/run"
+SL_LOG_DIR="$SL_RT/logs"
+SL_NOVNC_WEB="/usr/share/novnc"
+SL_QQ_BIN="${SNOWLUMA_QQ_BIN:-}"
+export TMPDIR="${TMPDIR:-/tmp}"
+
+target_proxy=""
+
+log() { printf '[snowluma] %s\n' "$*"; }
+warn() { printf '[snowluma] WARNING: %s\n' "$*" >&2; }
+die() { printf '[snowluma] ERROR: %s\n' "$*" >&2; exit 1; }
+
+need_dirs() {
+  mkdir -p "$SL_RT" "$SL_LOG_DIR" "$SL_RUN_DIR" "$SL_RT/pids"
+}
+
+pid_file() { printf '%s/pids/%s.pid' "$SL_RT" "$1"; }
+
+pid_of() {
+  local file
+  file="$(pid_file "$1")"
+  [ -s "$file" ] || return 1
+  cat "$file"
+}
+
+is_running() {
+  local pid
+  pid="$(pid_of "$1" 2>/dev/null || true)"
+  [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+}
+
+record_pid() {
+  printf '%s\n' "$2" > "$(pid_file "$1")"
+}
+
+stop_pid() {
+  local name="$1" pid
+  pid="$(pid_of "$name" 2>/dev/null || true)"
+  if [ -n "$pid" ]; then
+    kill "$pid" 2>/dev/null || true
+    sleep 1
+    kill -9 "$pid" 2>/dev/null || true
+  fi
+  rm -f "$(pid_file "$name")"
+}
+
+# ---------------------------------------------------------------- mirrors ----
+# Same proxy list and probe as the AstrBot shared installer, so a working
+# "加速器" setting behaves identically for both stacks.
+resolve_proxy() {
+  local candidate status
+  case "$SL_PROXY_CFG" in
+    direct|'')
+      target_proxy=""
+      return 0
+      ;;
+    https://*|http://*)
+      target_proxy="${SL_PROXY_CFG%/}"
+      log "使用自定义 GitHub 代理: $target_proxy"
+      return 0
+      ;;
+    auto) ;;
+    *)
+      warn "忽略无效的代理设置: $SL_PROXY_CFG"
+      ;;
+  esac
+
+  for candidate in \
+    https://ghfast.top \
+    https://gh-proxy.com \
+    https://ghproxy.net \
+    https://ghproxy.cc \
+    https://gh.dpik.top \
+    https://gh.monlor.com \
+    https://gh.chjina.com \
+    https://github.boki.moe \
+    https://gh.jasonzeng.dev \
+    https://gh.geekertao.top \
+    https://gh.nxnow.top \
+    https://down.npee.cn; do
+    status="$(curl -fL --connect-timeout 8 --max-time 20 -o /dev/null -s -w '%{http_code}' \
+      "$candidate/https://raw.githubusercontent.com/astral-sh/uv/main/README.md" || true)"
+    if [ "$status" = "200" ]; then
+      target_proxy="$candidate"
+      log "使用 GitHub 代理: $target_proxy"
+      return 0
+    fi
+  done
+  log "没有代理响应，尝试直连"
+}
+
+github_url() {
+  if [ -n "${target_proxy:-}" ]; then
+    printf '%s/%s\n' "${target_proxy%/}" "$1"
+  else
+    printf '%s\n' "$1"
+  fi
+}
+
+arch_tag() {
+  case "$(uname -m)" in
+    aarch64|arm64) printf 'arm64' ;;
+    x86_64|amd64) printf 'x64' ;;
+    *) die "不支持的架构: $(uname -m)" ;;
+  esac
+}
+
+# ------------------------------------------------------------------ deps ----
+install_deps() {
+  local missing=() pkg
+  for pkg in Xvfb fluxbox x11vnc websockify; do
+    command -v "$pkg" >/dev/null 2>&1 || missing+=("$pkg")
+  done
+  [ -d "$SL_NOVNC_WEB" ] || missing+=(novnc)
+  command -v curl >/dev/null 2>&1 || missing+=(curl)
+
+  if [ ${#missing[@]} -eq 0 ]; then
+    log "依赖已就绪"
+    return 0
+  fi
+
+  log "安装依赖: ${missing[*]}"
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get -o Acquire::ForceIPv4=true update || warn "apt-get update 失败，继续尝试安装"
+  apt-get -o Acquire::ForceIPv4=true install -y --no-install-recommends \
+    xvfb fluxbox x11vnc novnc websockify curl || return 1
+
+  for pkg in Xvfb fluxbox x11vnc websockify; do
+    command -v "$pkg" >/dev/null 2>&1 || { warn "依赖安装后仍缺少 $pkg"; return 1; }
+  done
+  [ -d "$SL_NOVNC_WEB" ] || { warn "noVNC 静态文件缺失: $SL_NOVNC_WEB"; return 1; }
+  log "依赖安装完成"
+}
+
+# -------------------------------------------------------------- download ----
+download_release() {
+  local tag archive tmp url
+  tag="$(arch_tag)"
+  archive="SnowLuma-v${SL_VERSION}-linux-${tag}.tar.gz"
+  tmp="$SL_RT/dl"
+  mkdir -p "$tmp"
+
+  if [ -n "$SL_TARBALL" ] && [ -f "$SL_TARBALL" ]; then
+    log "使用本地安装包: $SL_TARBALL"
+    cp -f "$SL_TARBALL" "$tmp/$archive" || return 1
+    SL_ARCHIVE="$tmp/$archive"
+    return 0
+  fi
+
+  if [ -s "$tmp/$archive" ] && tar -tzf "$tmp/$archive" >/dev/null 2>&1; then
+    log "复用已下载安装包: $archive"
+    SL_ARCHIVE="$tmp/$archive"
+    return 0
+  fi
+
+  resolve_proxy
+  url="$(github_url "https://github.com/SnowLuma/SnowLuma/releases/download/v${SL_VERSION}/${archive}")"
+  log "下载 $archive"
+  if ! curl -fsSL --connect-timeout 15 --retry 2 --no-progress-meter \
+      -o "$tmp/$archive.part" "$url"; then
+    rm -f "$tmp/$archive.part"
+    warn "下载失败: $url"
+    return 1
+  fi
+  mv -f "$tmp/$archive.part" "$tmp/$archive" || return 1
+  SL_ARCHIVE="$tmp/$archive"
+}
+
+# ---------------------------------------------------------------- install ----
+install_snowluma() {
+  local staging
+  SL_ARCHIVE=""
+  need_dirs
+  install_deps || return 1
+  download_release || return 1
+  [ -n "$SL_ARCHIVE" ] || { warn "未取得安装包"; return 1; }
+
+  log "解压安装包"
+  staging="$(mktemp -d "$SL_RT/unpack.XXXXXX")" || return 1
+  if ! tar -xzf "$SL_ARCHIVE" -C "$staging"; then
+    rm -rf "$staging"
+    return 1
+  fi
+  [ -f "$staging/index.mjs" ] || { rm -rf "$staging"; die "安装包结构异常: 缺少 index.mjs"; }
+
+  mkdir -p "$SL_HOME"
+  # Keep user data (config/, logs/) across reinstall/upgrade.
+  local keep
+  keep="$(mktemp -d "$SL_RT/keep.XXXXXX")"
+  [ -d "$SL_HOME/config" ] && cp -a "$SL_HOME/config" "$keep/config" 2>/dev/null || true
+  [ -d "$SL_HOME/logs" ] && cp -a "$SL_HOME/logs" "$keep/logs" 2>/dev/null || true
+
+  rm -rf "$SL_HOME.new"
+  mv "$staging" "$SL_HOME.new" || return 1
+  rm -rf "$SL_HOME"
+  mv "$SL_HOME.new" "$SL_HOME" || return 1
+  [ -d "$keep/config" ] && { rm -rf "$SL_HOME/config"; cp -a "$keep/config" "$SL_HOME/config"; }
+  [ -d "$keep/logs" ] && { rm -rf "$SL_HOME/logs"; cp -a "$keep/logs" "$SL_HOME/logs"; }
+  rm -rf "$keep"
+
+  chmod +x "$SL_HOME/launcher.sh" "$SL_HOME/node" 2>/dev/null || true
+  write_config
+  freeze_qq_hot_update
+  grant_ptrace
+  log "SnowLuma v${SL_VERSION} 安装完成: $SL_HOME"
+}
+
+write_config() {
+  mkdir -p "$SL_HOME/config"
+  SNOW_WEBUI_PORT="$SL_WEBUI_PORT" SNOW_WS_PORT="$SL_ONEBOT_WS_PORT" \
+    SNOW_HTTP_PORT="$SL_ONEBOT_HTTP_PORT" SNOW_TOKEN_FILE="$SL_RT/onebot-token" \
+    SNOW_CONFIG_DIR="$SL_HOME/config" "$SL_HOME/node" -e '
+const fs = require("fs");
+const path = require("path");
+const dir = process.env.SNOW_CONFIG_DIR;
+const runtimePath = path.join(dir, "runtime.json");
+const onebotPath = path.join(dir, "onebot.json");
+
+let runtime = {};
+try { runtime = JSON.parse(fs.readFileSync(runtimePath, "utf8")); } catch {}
+runtime.webuiPort = Number(process.env.SNOW_WEBUI_PORT);
+runtime.webuiHost = runtime.webuiHost || "127.0.0.1";
+runtime.hookAutoLoad = true;
+fs.writeFileSync(runtimePath, JSON.stringify(runtime, null, 2));
+
+let token = "";
+try { token = fs.readFileSync(process.env.SNOW_TOKEN_FILE, "utf8").trim(); } catch {}
+if (!token) {
+  token = require("crypto").randomBytes(24).toString("hex");
+  fs.writeFileSync(process.env.SNOW_TOKEN_FILE, token);
+}
+
+if (!fs.existsSync(onebotPath)) {
+  const adapter = (name, port) => ({
+    name,
+    enabled: true,
+    host: "127.0.0.1",
+    port: Number(port),
+    path: "/",
+    accessToken: token,
+    messageFormat: "array",
+    reportSelfMessage: false,
+  });
+  const config = {
+    networks: {
+      httpServers: [adapter("http-default", process.env.SNOW_HTTP_PORT)],
+      httpClients: [],
+      wsServers: [{ ...adapter("ws-default", process.env.SNOW_WS_PORT), role: "Universal" }],
+      wsClients: [],
+    },
+    musicSignUrl: "",
+  };
+  fs.writeFileSync(onebotPath, JSON.stringify(config, null, 2));
+}
+' || { warn "写入 SnowLuma 配置失败"; return 1; }
+  log "WebUI 端口 $SL_WEBUI_PORT / OneBot WS $SL_ONEBOT_WS_PORT / OneBot HTTP $SL_ONEBOT_HTTP_PORT"
+}
+
+# QQ silently hot-patches itself, which breaks version-matched native hooks.
+freeze_qq_hot_update() {
+  local hosts=/etc/hosts
+  [ -w "$hosts" ] || { warn "$hosts 不可写，跳过 QQ 热更新冻结"; return 0; }
+  if grep -q 'qqpatch.gtimg.cn' "$hosts" 2>/dev/null; then
+    return 0
+  fi
+  printf '0.0.0.0 qqpatch.gtimg.cn\n' >> "$hosts" && log "已冻结 QQ 静默热更新"
+}
+
+# ptrace injection needs cap_sys_ptrace on the node binary. Inside proot this
+# is usually denied; keep going and rely on the fallback hook paths.
+grant_ptrace() {
+  local node_bin="$SL_HOME/node"
+  [ -x "$node_bin" ] || return 0
+  if command -v setcap >/dev/null 2>&1; then
+    if setcap cap_sys_ptrace=ep "$node_bin" 2>/dev/null; then
+      log "已授予 cap_sys_ptrace: $node_bin"
+    else
+      warn "setcap 失败（proot 下常见），ptrace 注入可能不可用"
+    fi
+  fi
+}
+
+# ------------------------------------------------------------------ start ----
+port_open() {
+  local port="$1"
+  curl -s --max-time 2 -o /dev/null "http://127.0.0.1:${port}/" 2>/dev/null
+}
+
+start_xvfb() {
+  local lock="/tmp/.X${SL_DISPLAY_NUM}-lock"
+  mkdir -p /tmp/.X11-unix
+  chmod 1777 /tmp/.X11-unix 2>/dev/null || true
+  if [ -S "/tmp/.X11-unix/X${SL_DISPLAY_NUM}" ]; then
+    log "Xvfb :${SL_DISPLAY_NUM} 已在运行"
+  else
+    rm -f "$lock" "/tmp/.X11-unix/X${SL_DISPLAY_NUM}" 2>/dev/null || true
+    nohup Xvfb ":${SL_DISPLAY_NUM}" -screen 0 "$SL_SCREEN" +extension GLX +render \
+      > "$SL_LOG_DIR/xvfb.log" 2>&1 &
+    record_pid xvfb "$!"
+    local i
+    for i in $(seq 1 50); do
+      [ -S "/tmp/.X11-unix/X${SL_DISPLAY_NUM}" ] && break
+      sleep 0.1
+    done
+    [ -S "/tmp/.X11-unix/X${SL_DISPLAY_NUM}" ] || { warn "Xvfb 启动失败"; cat "$SL_LOG_DIR/xvfb.log" 2>/dev/null; return 1; }
+  fi
+  export DISPLAY=":${SL_DISPLAY_NUM}"
+
+  if ! is_running fluxbox; then
+    nohup fluxbox > "$SL_LOG_DIR/fluxbox.log" 2>&1 &
+    record_pid fluxbox "$!"
+    sleep 0.5
+  fi
+  return 0
+}
+
+start_vnc() {
+  export DISPLAY=":${SL_DISPLAY_NUM}"
+  if ! is_running x11vnc; then
+    mkdir -p "$HOME/.vnc"
+    [ -f "$HOME/.vnc/passwd" ] || x11vnc -storepasswd snowluma "$HOME/.vnc/passwd" >/dev/null 2>&1
+    nohup x11vnc -display ":$SL_DISPLAY_NUM" -noshm -rfbauth "$HOME/.vnc/passwd" \
+      -forever -shared -rfbport "$SL_VNCSERVER_PORT" -o "$SL_LOG_DIR/x11vnc.log" \
+      > /dev/null 2>&1 &
+    record_pid x11vnc "$!"
+    sleep 2
+  fi
+
+  if ! is_running novnc; then
+    if [ -x "$SL_NOVNC_WEB/utils/novnc_proxy" ]; then
+      nohup "$SL_NOVNC_WEB/utils/novnc_proxy" --vnc "127.0.0.1:${SL_VNCSERVER_PORT}" \
+        --listen "$SL_VNC_PORT" > "$SL_LOG_DIR/novnc.log" 2>&1 &
+    else
+      nohup websockify --web "$SL_NOVNC_WEB" "$SL_VNC_PORT" "127.0.0.1:${SL_VNCSERVER_PORT}" \
+        > "$SL_LOG_DIR/novnc.log" 2>&1 &
+    fi
+    record_pid novnc "$!"
+    sleep 2
+  fi
+  return 0
+}
+
+start_snowluma() {
+  local i
+  if is_running snowluma; then
+    log "SnowLuma 已在运行 (pid $(pid_of snowluma))"
+    return 0
+  fi
+  [ -f "$SL_HOME/index.mjs" ] || { warn "SnowLuma 未安装"; return 1; }
+
+  # The container has no desktop; SnowLuma shells out to xdg-open in web mode.
+  mkdir -p "$HOME/.local/bin"
+  if [ ! -x "$HOME/.local/bin/xdg-open" ]; then
+    printf '#!/bin/sh\nexit 0\n' > "$HOME/.local/bin/xdg-open"
+    chmod 755 "$HOME/.local/bin/xdg-open"
+  fi
+
+  log "启动 SnowLuma (WebUI :$SL_WEBUI_PORT)"
+  ( cd "$SL_HOME" && exec env \
+    SNOWLUMA_HOOK_RUNTIME_DIR="$SL_RUN_DIR" \
+    XDG_RUNTIME_DIR="$SL_RUN_DIR" \
+    "$SL_HOME/launcher.sh" ) > "$SL_LOG_DIR/snowluma.log" 2>&1 &
+  record_pid snowluma "$!"
+
+  for i in $(seq 1 30); do
+    if port_open "$SL_WEBUI_PORT"; then
+      log "SnowLuma 已启动"
+      return 0
+    fi
+    is_running snowluma || break
+    sleep 1
+  done
+  warn "SnowLuma WebUI 未在 $SL_WEBUI_PORT 响应，日志:"
+  tail -n 25 "$SL_LOG_DIR/snowluma.log" 2>/dev/null || true
+  return 1
+}
+
+cmd_start() {
+  need_dirs
+  [ -f "$SL_HOME/index.mjs" ] || die "SnowLuma 未安装，先运行: bash $0 install"
+  start_xvfb || return 1
+  start_vnc || return 1
+  start_snowluma || return 1
+  log "WebUI   : http://127.0.0.1:$SL_WEBUI_PORT/"
+  log "扫码    : http://127.0.0.1:$SL_VNC_PORT/vnc.html"
+  log "OneBot  : ws://127.0.0.1:$SL_ONEBOT_WS_PORT/ （登录后每账号独立实例）"
+  return 0
+}
+
+cmd_stop() {
+  stop_pid snowluma
+  stop_pid novnc
+  stop_pid x11vnc
+  stop_pid fluxbox
+  stop_pid xvfb
+  rm -f "/tmp/.X${SL_DISPLAY_NUM}-lock" "/tmp/.X11-unix/X${SL_DISPLAY_NUM}" 2>/dev/null || true
+  log "SnowLuma 已停止"
+}
+
+cmd_restart() {
+  cmd_stop
+  sleep 1
+  cmd_start
+}
+
+cmd_vnc() {
+  need_dirs
+  start_xvfb || return 1
+  start_vnc || return 1
+  log "扫码页面: http://127.0.0.1:$SL_VNC_PORT/vnc.html"
+}
+
+# Dedicated QQ instance: SnowLuma hooks a real QQ process, and QQ has a
+# single-instance lock, so it must not share HOME with the NapCat instances.
+cmd_qq() {
+  need_dirs
+  local qq_bin token mode
+  qq_bin="${SL_QQ_BIN:-}"
+  if [ -z "$qq_bin" ]; then
+    for candidate in /opt/QQ/qq /usr/bin/qq /usr/local/bin/qq; do
+      [ -x "$candidate" ] && { qq_bin="$candidate"; break; }
+    done
+  fi
+  [ -n "$qq_bin" ] || die "未找到 LinuxQQ，请先在环境管理里安装 NapCat 步骤（会顺带装 QQ）"
+
+  start_xvfb || return 1
+  export DISPLAY=":${SL_DISPLAY_NUM}"
+  mkdir -p "$SL_INSTANCE_HOME/.config" "$SL_INSTANCE_HOME/.cache" "$SL_INSTANCE_HOME/.local/share"
+
+  mode="$SL_HOOK_MODE"
+  [ "$mode" = "auto" ] && mode="inject"  # upstream path; "preload" is experimental
+
+  log "启动 QQ 实例: HOME=$SL_INSTANCE_HOME DISPLAY=:$SL_DISPLAY_NUM 注入模式=$mode"
+  if [ "$mode" = "preload" ]; then
+    local so="$SL_HOME/native/snowluma-linux-arm64.so"
+    ( cd "$SL_INSTANCE_HOME" && exec env \
+      HOME="$SL_INSTANCE_HOME" \
+      XDG_CONFIG_HOME="$SL_INSTANCE_HOME/.config" \
+      XDG_CACHE_HOME="$SL_INSTANCE_HOME/.cache" \
+      XDG_DATA_HOME="$SL_INSTANCE_HOME/.local/share" \
+      SNOWLUMA_HOOK_RUNTIME_DIR="$SL_RUN_DIR" \
+      XDG_RUNTIME_DIR="$SL_RUN_DIR" \
+      SNOWLUMA_HOOK_STUB_START=1 \
+      SNOWLUMA_HOOK_SERVICE_MODE=1 \
+      LD_PRELOAD="$so" \
+      "$qq_bin" --no-sandbox --disable-gpu ) >> "$SL_LOG_DIR/qq.log" 2>&1 &
+    record_pid qq "$!"
+  else
+    ( cd "$SL_INSTANCE_HOME" && exec env \
+      HOME="$SL_INSTANCE_HOME" \
+      XDG_CONFIG_HOME="$SL_INSTANCE_HOME/.config" \
+      XDG_CACHE_HOME="$SL_INSTANCE_HOME/.cache" \
+      XDG_DATA_HOME="$SL_INSTANCE_HOME/.local/share" \
+      SNOWLUMA_HOOK_RUNTIME_DIR="$SL_RUN_DIR" \
+      XDG_RUNTIME_DIR="$SL_RUN_DIR" \
+      "$qq_bin" --no-sandbox --disable-gpu ) >> "$SL_LOG_DIR/qq.log" 2>&1 &
+    record_pid qq "$!"
+  fi
+  log "QQ 已拉起，扫码请打开 http://127.0.0.1:$SL_VNC_PORT/vnc.html"
+}
+
+cmd_status() {
+  need_dirs
+  local installed=0 running=0 qq_up=0 token
+  [ -f "$SL_HOME/index.mjs" ] && installed=1
+  is_running snowluma && running=1
+  is_running qq && qq_up=1
+  token="$(cat "$SL_RT/onebot-token" 2>/dev/null || true)"
+  printf 'installed=%s\n' "$installed"
+  printf 'running=%s\n' "$running"
+  printf 'qq_running=%s\n' "$qq_up"
+  printf 'version=%s\n' "$SL_VERSION"
+  printf 'home=%s\n' "$SL_HOME"
+  printf 'webui_port=%s\n' "$SL_WEBUI_PORT"
+  printf 'vnc_port=%s\n' "$SL_VNC_PORT"
+  printf 'onebot_ws_port=%s\n' "$SL_ONEBOT_WS_PORT"
+  printf 'onebot_http_port=%s\n' "$SL_ONEBOT_HTTP_PORT"
+  printf 'webui_url=%s\n' "http://127.0.0.1:$SL_WEBUI_PORT/"
+  printf 'vnc_url=%s\n' "http://127.0.0.1:$SL_VNC_PORT/vnc.html"
+  printf 'onebot_url=%s\n' "ws://127.0.0.1:$SL_ONEBOT_WS_PORT/"
+  printf 'onebot_token=%s\n' "$token"
+  printf 'display=%s\n' ":$SL_DISPLAY_NUM"
+  printf 'pid=%s\n' "$(pid_of snowluma 2>/dev/null || echo 0)"
+}
+
+cmd_logs() {
+  need_dirs
+  tail -n "${2:-60}" "$SL_LOG_DIR/snowluma.log" 2>/dev/null || die "暂无日志"
+}
+
+cmd_uninstall() {
+  cmd_stop
+  stop_pid qq
+  rm -rf "$SL_HOME"
+  if [ "${1:-}" = "--clean-data" ]; then
+    rm -rf "$SL_RT"
+  fi
+  log "SnowLuma 已卸载${1:+（含数据）}"
+}
+
+usage() {
+  cat <<'EOF'
+Usage: snowluma.sh <command>
+
+  install              安装/升级 SnowLuma（依赖 + 官方 arm64 包 + 配置）
+  start                启动 Xvfb + fluxbox + x11vnc + noVNC + SnowLuma
+  stop                 停止全部进程
+  restart              重启
+  status               key=value 状态输出
+  qq                   启动独立 QQ 实例（登录扫码用）
+  vnc                  只重启扫码（noVNC）部分
+  logs [n]             查看 SnowLuma 日志
+  uninstall [--clean-data]
+EOF
+}
+
+main() {
+  need_dirs
+  case "${1:-}" in
+    install) install_snowluma ;;
+    start) cmd_start ;;
+    stop) cmd_stop ;;
+    restart) cmd_restart ;;
+    status) cmd_status ;;
+    qq) cmd_qq ;;
+    vnc) cmd_vnc ;;
+    logs) cmd_logs "$@" ;;
+    uninstall) shift; cmd_uninstall "${1:-}" ;;
+    help|--help|-h|'') usage ;;
+    *) usage; exit 2 ;;
+  esac
+}
+
+main "$@"

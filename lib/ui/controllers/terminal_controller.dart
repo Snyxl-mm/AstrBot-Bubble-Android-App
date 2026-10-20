@@ -116,6 +116,8 @@ class HomeController extends GetxController {
   final RxBool isAstrBotStopping = false.obs;
   final RxBool isOpenCodeRunning = false.obs;
   final RxBool isOpenCodeInstalled = false.obs;
+  final RxBool isSnowLumaRunning = false.obs;
+  final RxBool isSnowLumaInstalled = false.obs;
   final RxBool initialPasswordAssistanceCompleted = false.obs;
   final RxString homeBackgroundPath = ''.obs;
   final RxDouble cardGlassOpacity = 0.62.obs;
@@ -1050,6 +1052,166 @@ fi
     );
   }
 
+  // --------------------------------------------------------------- SnowLuma --
+  // SnowLuma is installed by assets/snowluma/snowluma.sh, which the app copies
+  // into the rootfs as /root/snowluma.sh. This keeps MuFengDR's signed
+  // installer chain untouched: no --step, no re-signing, no release fork.
+  static const String snowLumaVersion = '2.0.3';
+
+  String get snowLumaRuntimePath =>
+      '$ubuntuPath/root/.config/astrbot-android/snowluma';
+
+  String _snowLumaEnvironmentPrefix() {
+    return 'export TMPDIR=${_shellSingleQuote(RuntimeEnvir.tmpPath)}; '
+        'export SNOWLUMA_VERSION=${_shellSingleQuote(snowLumaVersion)}; '
+        'export SNOWLUMA_WEBUI_PORT=${ServicePorts.snowLumaWebUiPort}; '
+        'export SNOWLUMA_VNC_PORT=${ServicePorts.snowLumaVncPort}; '
+        'export SNOWLUMA_ONEBOT_WS_PORT=${ServicePorts.snowLumaOneBotWsPort}; '
+        'export SNOWLUMA_GITHUB_PROXY=${_shellSingleQuote(EnvironmentConfig.githubProxy)}; ';
+  }
+
+  /// Runs `snowluma.sh <command>` inside the Ubuntu rootfs in its own tab.
+  /// [keepSessionAlive] keeps the proot session (and therefore every daemon
+  /// started by the script) alive after the command returns.
+  Future<void> _openSnowLumaTerminal({
+    required String title,
+    required String command,
+    required String doneMarker,
+    bool keepSessionAlive = false,
+    void Function()? onCommandDone,
+    void Function(String output)? onOutput,
+  }) async {
+    await prepareInitialUbuntuEnvironment();
+    final ubuntuStepCommand = StringBuffer()
+      ..write(_snowLumaEnvironmentPrefix())
+      ..write('bash /root/snowluma.sh $command; status=\$?; ')
+      ..write("printf '%s\\n' ${_shellSingleQuote(doneMarker)}; ");
+    if (keepSessionAlive) {
+      ubuntuStepCommand.write('exec /bin/bash -il');
+    } else {
+      ubuntuStepCommand.write('exit \$status');
+    }
+
+    final scriptFile = File(
+      '${RuntimeEnvir.homePath}/snowluma_${DateTime.now().millisecondsSinceEpoch}.sh',
+    );
+    final script = StringBuffer()
+      ..writeln('source ${RuntimeEnvir.homePath}/common.sh')
+      ..writeln('install_ubuntu || exit 1')
+      ..writeln('copy_files || exit 1')
+      ..writeln(
+        'login_ubuntu ${_shellSingleQuote(ubuntuStepCommand.toString())}',
+      );
+    await scriptFile.writeAsString(_toUnixLineEndings(script.toString()));
+
+    final terminalCommand = StringBuffer()
+      ..writeln('source ${RuntimeEnvir.homePath}/common.sh')
+      ..writeln('sh ${_shellSingleQuote(scriptFile.path)}');
+    await terminalTabManager.addCommandTerminalTab(
+      title: title,
+      command: terminalCommand.toString(),
+      onDoneMarker: doneMarker,
+      onCommandDone: onCommandDone,
+      onOutput: onOutput,
+    );
+  }
+
+  Future<void> installSnowLuma({void Function()? onCommandDone}) async {
+    await _openSnowLumaTerminal(
+      title: '安装 SnowLuma',
+      command: 'install',
+      doneMarker: '__SNOWLUMA_INSTALL_DONE__',
+      onCommandDone: () {
+        isSnowLumaInstalled.value = true;
+        onCommandDone?.call();
+      },
+    );
+  }
+
+  Future<void> startSnowLuma({void Function()? onCommandDone}) async {
+    await _openSnowLumaTerminal(
+      title: '启动 SnowLuma',
+      command: 'start',
+      doneMarker: '__SNOWLUMA_START_DONE__',
+      keepSessionAlive: true,
+      onCommandDone: () {
+        isSnowLumaRunning.value = true;
+        onCommandDone?.call();
+      },
+    );
+  }
+
+  Future<void> stopSnowLuma({void Function()? onCommandDone}) async {
+    await _openSnowLumaTerminal(
+      title: '停止 SnowLuma',
+      command: 'stop',
+      doneMarker: '__SNOWLUMA_STOP_DONE__',
+      onCommandDone: () {
+        isSnowLumaRunning.value = false;
+        onCommandDone?.call();
+      },
+    );
+  }
+
+  /// Launches the dedicated QQ instance SnowLuma hooks (scan login via noVNC).
+  Future<void> launchSnowLumaQq({void Function()? onCommandDone}) async {
+    await _openSnowLumaTerminal(
+      title: 'SnowLuma QQ',
+      command: 'qq',
+      doneMarker: '__SNOWLUMA_QQ_DONE__',
+      keepSessionAlive: true,
+      onCommandDone: onCommandDone,
+    );
+  }
+
+  Future<void> uninstallSnowLuma({
+    bool cleanData = false,
+    void Function()? onCommandDone,
+  }) async {
+    await _openSnowLumaTerminal(
+      title: '卸载 SnowLuma',
+      command: cleanData ? 'uninstall --clean-data' : 'uninstall',
+      doneMarker: '__SNOWLUMA_UNINSTALL_DONE__',
+      onCommandDone: () {
+        isSnowLumaRunning.value = false;
+        isSnowLumaInstalled.value = false;
+        onCommandDone?.call();
+      },
+    );
+  }
+
+  /// OneBot access token generated by snowluma.sh, for pasting into AstrBot.
+  Future<String?> readSnowLumaOneBotToken() async {
+    try {
+      final file = File('$snowLumaRuntimePath/onebot-token');
+      if (!await file.exists()) return null;
+      final token = (await file.readAsString()).trim();
+      return token.isEmpty ? null : token;
+    } catch (e) {
+      Log.e('读取 SnowLuma OneBot token 失败: $e', tag: 'SnowLuma');
+      return null;
+    }
+  }
+
+  /// Reads the pid file written by snowluma.sh and checks it from the host:
+  /// proot processes are children of the app, so /proc/<pid> is visible.
+  Future<bool> refreshSnowLumaRunning() async {
+    try {
+      final pidFile = File('$snowLumaRuntimePath/pids/snowluma.pid');
+      if (!await pidFile.exists()) {
+        isSnowLumaRunning.value = false;
+        return false;
+      }
+      final pid = int.tryParse((await pidFile.readAsString()).trim()) ?? 0;
+      final alive = pid > 0 && await Directory('/proc/$pid').exists();
+      isSnowLumaRunning.value = alive;
+      return alive;
+    } catch (e) {
+      Log.e('读取 SnowLuma 运行状态失败: $e', tag: 'SnowLuma');
+      return isSnowLumaRunning.value;
+    }
+  }
+
   Future<void> checkInstallerUpdate({
     void Function()? onCommandDone,
     void Function(bool updateAvailable)? onUpdateAvailable,
@@ -1283,6 +1445,12 @@ fi
     );
     await AssetsUtils.copyAssetToPath(
         'assets/cmd_config.json', '${RuntimeEnvir.homePath}/cmd_config.json');
+    // SnowLuma controller: delivered to the rootfs by copy_files().
+    await AssetsUtils.copyAssetToPath(
+      'assets/snowluma/snowluma.sh',
+      '${RuntimeEnvir.homePath}/snowluma.sh',
+      forceCopy: true,
+    );
 
     final appVersion = await getAppVersion();
     File('${RuntimeEnvir.homePath}/common.sh').writeAsStringSync(
@@ -2772,6 +2940,18 @@ fi
 
   void requestOpenOpenCodeWebUi() {
     const targetId = 'opencode';
+    showWebUiTarget(targetId);
+    pendingWebUiTargetId.value = targetId;
+  }
+
+  void requestOpenSnowLumaWebUi() {
+    const targetId = 'snowluma';
+    showWebUiTarget(targetId);
+    pendingWebUiTargetId.value = targetId;
+  }
+
+  void requestOpenSnowLumaVnc() {
+    const targetId = 'snowluma-vnc';
     showWebUiTarget(targetId);
     pendingWebUiTargetId.value = targetId;
   }

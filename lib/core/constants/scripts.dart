@@ -533,6 +533,10 @@ copy_files(){
   cp ~/astrbot-installer-bootstrap.sh "\$UBUNTU_PATH/root/astrbot-installer-bootstrap.sh"
   chmod 700 "\$UBUNTU_PATH/root/astrbot-installer-bootstrap.sh"
   cp ~/cmd_config.json "\$UBUNTU_PATH/root/cmd_config.json"
+  if [ -f ~/snowluma.sh ]; then
+    tr -d '\\r' < ~/snowluma.sh > "\$UBUNTU_PATH/root/snowluma.sh"
+    chmod 700 "\$UBUNTU_PATH/root/snowluma.sh"
+  fi
   echo "installer bootstrap refreshed"
 }
 ''';

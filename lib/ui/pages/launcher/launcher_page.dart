@@ -220,6 +220,23 @@ class _LauncherPageState extends State<LauncherPage>
       }
     }
 
+    if (step.id == 'snowluma') {
+      // SnowLuma is not part of the signed installer chain (no --step entry);
+      // it is driven by assets/snowluma/snowluma.sh instead.
+      try {
+        await homeController.installSnowLuma(onCommandDone: () {
+          if (mounted) {
+            _refreshEnvironmentStatus();
+          }
+        });
+        _showSnack('SnowLuma 安装任务已进入终端');
+        widget.onNavigate?.call(2);
+      } catch (e) {
+        _showSnack('启动失败：$e');
+      }
+      return;
+    }
+
     try {
       await homeController.runEnvironmentStep(
         step: step.id,
@@ -713,6 +730,7 @@ class _LauncherPageState extends State<LauncherPage>
       final napCatReady = scriptReady && baseCommandReady && await _hasNapCat();
       final astrBotReady = scriptReady && uvReady && await _hasAstrBot();
       final openCodeReady = scriptReady && baseCommandReady && await _hasOpenCode();
+      final snowLumaReady = scriptReady && await _hasSnowLuma();
 
       if (!mounted) return;
       setState(() {
@@ -740,6 +758,12 @@ class _LauncherPageState extends State<LauncherPage>
           enabled: scriptReady && baseCommandReady,
         );
         homeController.isOpenCodeInstalled.value = openCodeReady;
+        _environmentStates['snowluma'] = _EnvStepState(
+          installed: snowLumaReady,
+          enabled: scriptReady,
+        );
+        homeController.isSnowLumaInstalled.value = snowLumaReady;
+        unawaited(homeController.refreshSnowLumaRunning());
         _initialEnvironmentCheckComplete = true;
       });
     } catch (error) {
@@ -889,6 +913,10 @@ class _LauncherPageState extends State<LauncherPage>
     return File('${scripts.ubuntuPath}/root/.local/bin/opencode').exists();
   }
 
+  Future<bool> _hasSnowLuma() {
+    return File('${scripts.ubuntuPath}/root/snowluma/index.mjs').exists();
+  }
+
   @override
   Widget build(BuildContext context) {
     return Obx(() {
@@ -927,6 +955,14 @@ class _LauncherPageState extends State<LauncherPage>
                             ? Column(
                                 children: [
                                   _buildOpenCodeCard(context),
+                                  const SizedBox(height: 12),
+                                ],
+                              )
+                            : const SizedBox.shrink()),
+                        Obx(() => homeController.isSnowLumaInstalled.value
+                            ? Column(
+                                children: [
+                                  _buildSnowLumaCard(context),
                                   const SizedBox(height: 12),
                                 ],
                               )
@@ -2337,6 +2373,228 @@ class _LauncherPageState extends State<LauncherPage>
     }
   }
 
+  Widget _buildSnowLumaCard(BuildContext context) {
+    return GlassPanel(
+      padding: const EdgeInsets.all(16),
+      opacity: homeController.cardGlassOpacity.value,
+      blur: homeController.glassBlurAmount.value * 30,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              const Icon(Icons.cable),
+              const SizedBox(width: 8),
+              Text('SnowLuma', style: Theme.of(context).textTheme.titleMedium),
+              const Spacer(),
+              PopupMenuButton<String>(
+                tooltip: 'SnowLuma 更多',
+                onSelected: (value) {
+                  if (value == 'qq') _launchSnowLumaQq();
+                  if (value == 'token') _copySnowLumaOneBotToken();
+                  if (value == 'uninstall') _showSnowLumaUninstallDialog();
+                },
+                itemBuilder: (context) => const [
+                  PopupMenuItem(
+                    value: 'qq',
+                    child: ListTile(
+                      leading: Icon(Icons.qr_code_2),
+                      title: Text('启动 QQ（扫码登录）'),
+                      contentPadding: EdgeInsets.zero,
+                    ),
+                  ),
+                  PopupMenuItem(
+                    value: 'token',
+                    child: ListTile(
+                      leading: Icon(Icons.key),
+                      title: Text('复制 OneBot 连接信息'),
+                      contentPadding: EdgeInsets.zero,
+                    ),
+                  ),
+                  PopupMenuItem(
+                    value: 'uninstall',
+                    child: ListTile(
+                      leading: Icon(Icons.delete_outline),
+                      title: Text('卸载'),
+                      contentPadding: EdgeInsets.zero,
+                    ),
+                  ),
+                ],
+              ),
+            ],
+          ),
+          const SizedBox(height: 12),
+          Row(
+            children: [
+              Expanded(
+                child: Obx(() => _homeButton(
+                      context: context,
+                      tone: homeController.isSnowLumaRunning.value
+                          ? _HomeButtonTone.destructive
+                          : _HomeButtonTone.primary,
+                      onPressed: _toggleSnowLuma,
+                      icon: Icon(homeController.isSnowLumaRunning.value
+                          ? Icons.stop
+                          : Icons.play_arrow),
+                      label: Text(homeController.isSnowLumaRunning.value
+                          ? '停止'
+                          : '启动'),
+                    )),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: _homeButton(
+                  context: context,
+                  onPressed: _openSnowLumaWebUi,
+                  icon: const Icon(Icons.language),
+                  label: const Text('打开 WebUI'),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          Row(
+            children: [
+              Expanded(
+                child: _homeButton(
+                  context: context,
+                  onPressed: _openSnowLumaVnc,
+                  icon: const Icon(Icons.qr_code_2),
+                  label: const Text('扫码登录（noVNC）'),
+                ),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _toggleSnowLuma() async {
+    final running = homeController.isSnowLumaRunning.value;
+    try {
+      if (running) {
+        await homeController.stopSnowLuma(onCommandDone: () {
+          _refreshEnvironmentStatus();
+        });
+        _showSnack('SnowLuma 停止任务已进入终端');
+      } else {
+        await homeController.startSnowLuma(onCommandDone: () {
+          _refreshEnvironmentStatus();
+        });
+        _showSnack('SnowLuma 启动任务已进入终端');
+      }
+      widget.onNavigate?.call(2);
+    } catch (e) {
+      _showSnack('操作失败：$e');
+    }
+  }
+
+  Future<void> _launchSnowLumaQq() async {
+    try {
+      await homeController.launchSnowLumaQq(onCommandDone: () {
+        _refreshEnvironmentStatus();
+      });
+      _showSnack('已启动 SnowLuma QQ，请在扫码页登录');
+      widget.onNavigate?.call(2);
+    } catch (e) {
+      _showSnack('启动 QQ 失败：$e');
+    }
+  }
+
+  Future<bool> _waitForLocalPort(int port) async {
+    for (var attempt = 0; attempt < 15 && mounted; attempt++) {
+      final client = HttpClient()
+        ..connectionTimeout = const Duration(seconds: 2);
+      var ready = false;
+      try {
+        final request = await client
+            .getUrl(Uri.parse('http://127.0.0.1:$port/'))
+            .timeout(const Duration(seconds: 2));
+        final response =
+            await request.close().timeout(const Duration(seconds: 2));
+        await response.drain<void>();
+        ready = response.statusCode > 0;
+      } catch (_) {
+        ready = false;
+      } finally {
+        client.close(force: true);
+      }
+      if (ready) return true;
+      await Future<void>.delayed(const Duration(seconds: 1));
+    }
+    return false;
+  }
+
+  Future<void> _openSnowLumaWebUi() async {
+    if (!homeController.isSnowLumaRunning.value) {
+      _showSnack('请先启动 SnowLuma');
+      return;
+    }
+    _showSnack('正在等待 SnowLuma WebUI 就绪');
+    if (!await _waitForLocalPort(ServicePorts.snowLumaWebUiPort)) {
+      _showSnack('SnowLuma WebUI 暂未响应，请查看终端日志');
+      return;
+    }
+    if (!mounted) return;
+    homeController.requestOpenSnowLumaWebUi();
+    widget.onNavigate?.call(1);
+  }
+
+  Future<void> _openSnowLumaVnc() async {
+    if (!homeController.isSnowLumaRunning.value) {
+      _showSnack('请先启动 SnowLuma');
+      return;
+    }
+    _showSnack('正在等待 noVNC 就绪');
+    if (!await _waitForLocalPort(ServicePorts.snowLumaVncPort)) {
+      _showSnack('noVNC 暂未响应，请查看终端日志');
+      return;
+    }
+    if (!mounted) return;
+    homeController.requestOpenSnowLumaVnc();
+    widget.onNavigate?.call(1);
+  }
+
+  Future<void> _copySnowLumaOneBotToken() async {
+    final token = await homeController.readSnowLumaOneBotToken();
+    if (token == null) {
+      _showSnack('未找到 OneBot token，请先启动一次 SnowLuma');
+      return;
+    }
+    final url = ServicePorts.snowLumaOneBotWsUrl;
+    await Clipboard.setData(
+      ClipboardData(text: '$url?access_token=$token'),
+    );
+    _showSnack('已复制：$url?access_token=****');
+  }
+
+  Future<void> _showSnowLumaUninstallDialog() async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('卸载 SnowLuma'),
+        content: const Text('将删除 SnowLuma 程序文件，配置与登录态保留。是否继续？'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(false),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(context).pop(true),
+            child: const Text('卸载'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true) return;
+    await homeController.uninstallSnowLuma(cleanData: false, onCommandDone: () {
+      _refreshEnvironmentStatus();
+    });
+    _showSnack('SnowLuma 卸载任务已进入终端');
+    widget.onNavigate?.call(2);
+  }
+
   Widget _buildOpenCodeCard(BuildContext context) {
     return GlassPanel(
       padding: const EdgeInsets.all(16),
@@ -2487,6 +2745,14 @@ class _LauncherPageState extends State<LauncherPage>
         const Icon(Icons.smart_toy_outlined),
         isExtension: true,
         reinstallDescription: '将重新下载 OpenCode 二进制文件。是否继续？',
+      ),
+      _EnvStep(
+        'snowluma',
+        'SnowLuma',
+        'QQ 协议框架（独立 QQ 实例 + noVNC 扫码）',
+        const Icon(Icons.cable),
+        isExtension: true,
+        reinstallDescription: '将重新下载 SnowLuma 并保留配置与登录态。是否继续？',
       ),
     ];
 
