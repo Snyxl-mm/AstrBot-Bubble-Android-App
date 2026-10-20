@@ -84,6 +84,13 @@ jobs:
         continue-on-error: true
         run: flutter analyze
 
+      - name: Bump Gradle wrapper to Flutter minimum
+        # 上游 android/gradle/wrapper 锁的是 8.11.1；Flutter 3.40+ 要求 Gradle ≥ 8.14.0
+        run: |
+          F=android/gradle/wrapper/gradle-wrapper.properties
+          sed -i -E 's#gradle-[0-9.]+-bin\.zip#gradle-8.14.3-bin.zip#' "$F"
+          grep -E 'distributionUrl' "$F"
+
       - name: Build APK
         run: |
           MODE="${{ inputs.build_mode }}"
