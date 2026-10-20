@@ -52,7 +52,9 @@ jobs:
         run: |
           flutter --version
           java -version
-          echo "ARCH=$(uname -m)  CORES=$(nproc)"
+          echo "ARCH=$(uname -m) CORES=$(nproc)"
+          echo "--- gradle wrapper:"; grep distributionUrl android/gradle/wrapper/gradle-wrapper.properties
+          echo "--- plugins:"; grep -E "com\\.android\\.application|kotlin\\.android" android/settings.gradle
 
       # 可选：配置 release 签名。在仓库 Settings → Secrets 里放好
       # KEYSTORE_BASE64 / STORE_PASSWORD / KEY_PASSWORD / KEY_ALIAS 即生效；
@@ -90,6 +92,20 @@ jobs:
           F=android/gradle/wrapper/gradle-wrapper.properties
           sed -i -E 's#gradle-[0-9.]+-bin\.zip#gradle-8.14.3-bin.zip#' "$F"
           grep -E 'distributionUrl' "$F"
+
+      - name: Bump Android Gradle Plugin to Flutter minimum
+        # 上游 settings.gradle 写死 AGP 8.9.1；Flutter 3.40+ 要求 ≥ 8.11.1
+        run: |
+          python3 - <<'PYEOF'
+          import pathlib, re
+          p = pathlib.Path("android/settings.gradle")
+          s = p.read_text()
+          s = re.sub(r"(id 'com\.android\.application' version ')[^']+(')", r"\g<1>8.11.1\g<2>", s)
+          p.write_text(s)
+          for line in s.splitlines():
+              if "com.android.application" in line or "kotlin.android" in line:
+                  print(line.strip())
+          PYEOF
 
       - name: Build APK
         run: |
