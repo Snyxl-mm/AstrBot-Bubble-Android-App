@@ -86,25 +86,24 @@ jobs:
         continue-on-error: true
         run: flutter analyze
 
-      - name: Bump Gradle wrapper to Flutter minimum
-        # 上游 android/gradle/wrapper 锁的是 8.11.1；Flutter 3.40+ 要求 Gradle ≥ 8.14.0
-        run: |
-          F=android/gradle/wrapper/gradle-wrapper.properties
-          sed -i -E 's#gradle-[0-9.]+-bin\.zip#gradle-8.14.3-bin.zip#' "$F"
-          grep -E 'distributionUrl' "$F"
-
-      - name: Bump Android Gradle Plugin to Flutter minimum
-        # 上游 settings.gradle 写死 AGP 8.9.1；Flutter 3.40+ 要求 ≥ 8.11.1
+      - name: Bump Gradle/AGP/Kotlin to Flutter minimums
+        # 上游模板锁的是 Gradle 8.11.1 / AGP 8.9.1 / Kotlin 2.1.0；
+        # Flutter 3.40+ 要求 Gradle ≥8.14、AGP ≥8.11.1、Kotlin ≥2.2.20
         run: |
           python3 - <<'PYEOF'
           import pathlib, re
-          p = pathlib.Path("android/settings.gradle")
-          s = p.read_text()
-          s = re.sub(r"(id 'com\.android\.application' version ')[^']+(')", r"\g<1>8.11.1\g<2>", s)
-          p.write_text(s)
-          for line in s.splitlines():
+          b = pathlib.Path("android")
+          w = b / "gradle/wrapper/gradle-wrapper.properties"
+          w.write_text(re.sub(r"gradle-[0-9.]+-bin\.zip", "gradle-8.14.3-bin.zip", w.read_text()))
+          s = b / "settings.gradle"
+          t = s.read_text()
+          t = re.sub(r"(id 'com\.android\.application' version ')[^']+(')", r"\g<1>8.11.1\g<2>", t)
+          t = re.sub(r"(id 'org\.jetbrains\.kotlin\.android' version ')[^']+(')", r"\g<1>2.2.20\g<2>", t)
+          s.write_text(t)
+          print("gradle:", re.search(r"gradle-[0-9.]+-bin", w.read_text()).group(0))
+          for line in t.splitlines():
               if "com.android.application" in line or "kotlin.android" in line:
-                  print(line.strip())
+                  print("plugin:", line.strip())
           PYEOF
 
       - name: Build APK
