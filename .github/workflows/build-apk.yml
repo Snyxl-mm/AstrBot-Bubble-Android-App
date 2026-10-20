@@ -41,6 +41,15 @@ jobs:
           distribution: temurin
           java-version: '17'
 
+      - name: Gradle cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('**/gradle-wrapper.properties', '**/*.gradle') }}
+          restore-keys: gradle-${{ runner.os }}-
+
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
         with:
@@ -106,31 +115,45 @@ jobs:
                   print("plugin:", line.strip())
           PYEOF
 
-      - name: Build APK
+      - name: Build APK (gradle direct)
+        id: build
         run: |
-          MODE="${{ inputs.build_mode }}"
-          [ -z "$MODE" ] && MODE=release
-          echo "构建模式: $MODE"
-          if [ "$MODE" = "debug" ]; then
-            flutter build apk --debug
-          else
-            flutter build apk --release
-          fi
+          df -h / | tail -1
+          cd android
+          set +e
+          ./gradlew assembleRelease --stacktrace 2>&1 | tail -150
+          rc=${PIPESTATUS[0]}
+          echo "gradle_exit=$rc"
+          df -h / | tail -1
+          exit $rc
+
+      - name: Inspect build outputs
+        if: always()
+        run: |
+          echo "=== apk/aab 搜索 ==="
+          find . -name '*.apk' -o -name '*.aab' 2>/dev/null | head -30
+          echo "=== android/app/build/outputs ==="
+          ls -R android/app/build/outputs 2>/dev/null | head -60 || true
+          echo "=== build/app/outputs ==="
+          ls -R build/app/outputs 2>/dev/null | head -40 || true
 
       - name: Collect artifacts
+        if: always()
         run: |
-          mkdir -p dist
-          cp build/app/outputs/flutter-apk/*.apk dist/ 2>/dev/null || true
-          ls -lh dist
-          sha256sum dist/*.apk > dist/SHA256SUMS.txt || true
+          mkdir -p "$GITHUB_WORKSPACE/dist"
+          find . -name '*.apk' -exec cp -v {} $GITHUB_WORKSPACE/dist/ \; 2>/dev/null || true
+          ls -lh "$GITHUB_WORKSPACE/dist"
+          (cd "$GITHUB_WORKSPACE/dist" && sha256sum *.apk > SHA256SUMS.txt) 2>/dev/null || true
 
       - name: Upload APK
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: astrbot-bubble-apk-${{ github.sha }}
           path: |
             dist/*.apk
             dist/SHA256SUMS.txt
+          if-no-files-found: warn
           retention-days: 30
 
       - name: Attach to release (tags only)
