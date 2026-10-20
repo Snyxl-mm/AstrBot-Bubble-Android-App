@@ -161,6 +161,11 @@ install_deps() {
   done
   [ -d "$SL_NOVNC_WEB" ] || missing+=(novnc)
   command -v curl >/dev/null 2>&1 || missing+=(curl)
+  command -v dbus-launch >/dev/null 2>&1 || missing+=(dbus-x11)
+  # QQ 界面是中文，缺 CJK 字体时整屏变方块，扫码都没法扫
+  if ! fc-list :lang=zh 2>/dev/null | grep -q .; then
+    missing+=(fonts-noto-cjk)
+  fi
 
   if [ ${#missing[@]} -eq 0 ]; then
     log "依赖已就绪"
@@ -171,7 +176,7 @@ install_deps() {
   export DEBIAN_FRONTEND=noninteractive
   apt-get -o Acquire::ForceIPv4=true update || warn "apt-get update 失败，继续尝试安装"
   apt-get -o Acquire::ForceIPv4=true install -y --no-install-recommends \
-    xvfb fluxbox x11vnc novnc websockify curl || return 1
+    xvfb fluxbox x11vnc novnc websockify curl dbus-x11 fonts-noto-cjk || return 1
 
   for pkg in Xvfb fluxbox x11vnc websockify; do
     command -v "$pkg" >/dev/null 2>&1 || { warn "依赖安装后仍缺少 $pkg"; return 1; }
@@ -379,6 +384,35 @@ port_open() {
   curl -s --max-time 2 -o /dev/null "http://127.0.0.1:${port}/" 2>/dev/null
 }
 
+# 给 fluxbox 指定 CJK 字体。注意：部分 fluxbox 构建只认 X core 字体（不含中文），
+# 此时窗口标题栏仍可能显示方块 —— 只影响标题外观，QQ 界面内容（fontconfig 渲染）正常。
+ensure_fluxbox_font() {
+  local dir="$HOME/.fluxbox"
+  local init="$dir/init"
+  mkdir -p "$dir"
+  if [ ! -f "$init" ]; then
+    printf '%s\n' \
+      'session.screen0.window.font: Noto Sans CJK SC-10' \
+      'session.screen0.toolbar.font: Noto Sans CJK SC-10' \
+      'session.screen0.menu.font: Noto Sans CJK SC-10' \
+      'session.screen0.toolbar.visible: true' \
+      > "$init"
+    return 0
+  fi
+  # 保证文件以换行结尾，否则新键会拼到上一行末尾（fluxbox 默认 init 常缺尾换行）
+  if [ -s "$init" ] && [ -n "$(tail -c1 "$init")" ]; then
+    printf '\n' >> "$init"
+  fi
+  local key
+  for key in window toolbar menu; do
+    if grep -q "session.screen0.${key}.font" "$init"; then
+      sed -i -E "s#^session\.screen0\.${key}\.font:.*#session.screen0.${key}.font: Noto Sans CJK SC-10#" "$init"
+    else
+      printf 'session.screen0.%s.font: Noto Sans CJK SC-10\n' "$key" >> "$init"
+    fi
+  done
+}
+
 start_xvfb() {
   local lock="/tmp/.X${SL_DISPLAY_NUM}-lock"
   mkdir -p /tmp/.X11-unix
@@ -399,6 +433,7 @@ start_xvfb() {
   fi
   export DISPLAY=":${SL_DISPLAY_NUM}"
 
+  ensure_fluxbox_font
   if ! is_running fluxbox; then
     nohup fluxbox > "$SL_LOG_DIR/fluxbox.log" 2>&1 &
     record_pid fluxbox "$!"
