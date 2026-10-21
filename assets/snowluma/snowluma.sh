@@ -148,6 +148,35 @@ github_url() {
   fi
 }
 
+# 下载用：按优先顺序列出代理（空行代表直连）。显式指定 URL 时只用它 + 直连兜底。
+proxy_candidates() {
+  case "$SL_PROXY_CFG" in
+    direct|'') printf '%s\n' '' ;;
+    https://*|http://*)
+      printf '%s\n' "${SL_PROXY_CFG%/}"
+      printf '%s\n' ''
+      ;;
+    *)
+      [ -n "${target_proxy:-}" ] && printf '%s\n' "${target_proxy%/}"
+      for candidate in \
+        https://ghfast.top \
+        https://gh-proxy.com \
+        https://ghproxy.net \
+        https://ghproxy.cc \
+        https://gh.dpik.top \
+        https://gh.monlor.com \
+        https://gh.jina.ai \
+        https://github.boki.moe \
+        https://gh.nxnow.top \
+        https://down.npee.cn; do
+        [ "$candidate" = "${target_proxy:-}" ] && continue
+        printf '%s\n' "$candidate"
+      done
+      printf '%s\n' ''
+      ;;
+  esac
+}
+
 arch_tag() {
   case "$(uname -m)" in
     aarch64|arm64) printf 'arm64' ;;
@@ -210,12 +239,31 @@ download_release() {
   fi
 
   resolve_proxy
-  url="$(github_url "https://github.com/SnowLuma/SnowLuma/releases/download/v${SL_VERSION}/${archive}")"
-  log "下载 $archive"
-  if ! curl -fsSL --connect-timeout 15 --retry 2 --no-progress-meter \
-      -o "$tmp/$archive.part" "$url"; then
-    rm -f "$tmp/$archive.part"
-    warn "下载失败: $url"
+  local upstream="https://github.com/SnowLuma/SnowLuma/releases/download/v${SL_VERSION}/${archive}"
+  local proxy url rc=1
+  log "下载 $archive（约 49 MB，带进度条；卡住会自动换源续传）"
+  while IFS= read -r proxy; do
+    if [ -n "$proxy" ]; then
+      url="$proxy/$upstream"
+      log "源: $proxy"
+    else
+      url="$upstream"
+      log "源: 直连"
+    fi
+    # -C - 续传；--speed-limit/--speed-time：30 秒内低于 10KB/s 判定断流，自动换下一个源
+    if curl -fL --progress-bar -C - \
+        --connect-timeout 15 --max-time 3600 \
+        --speed-limit 10240 --speed-time 30 \
+        -o "$tmp/$archive.part" "$url"; then
+      rc=0
+      break
+    fi
+    warn "该源失败或过慢，换下一个"
+  done <<< "$(proxy_candidates)"
+
+  if [ "$rc" -ne 0 ]; then
+    warn "所有源都失败。可手动下载后放到 $tmp/$archive 再重跑 install："
+    warn "  curl -fL --progress-bar -C - -o '$tmp/$archive.part' '<代理>/$upstream'"
     return 1
   fi
   mv -f "$tmp/$archive.part" "$tmp/$archive" || return 1

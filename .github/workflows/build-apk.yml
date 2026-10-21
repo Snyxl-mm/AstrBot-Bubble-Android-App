@@ -141,7 +141,13 @@ jobs:
         if: always()
         run: |
           mkdir -p "$GITHUB_WORKSPACE/dist"
-          find . -name '*.apk' -exec cp -v {} $GITHUB_WORKSPACE/dist/ \; 2>/dev/null || true
+          # 只取主包，排除 profileTest 变体与重复拷贝（artifact 从 228MB 降到 ~73MB）
+          sel=$(find . \( -name 'app-normal-release.apk' -o -name 'app-release.apk' \) -print -quit)
+          if [ -z "$sel" ]; then
+            sel=$(find . -name '*.apk' ! -name '*profileTest*' ! -name '*profiletest*' -print -quit)
+          fi
+          echo "选中: $sel"
+          [ -n "$sel" ] && cp -v "$sel" "$GITHUB_WORKSPACE/dist/AstrBot-SnowLuma-release.apk"
           ls -lh "$GITHUB_WORKSPACE/dist"
           (cd "$GITHUB_WORKSPACE/dist" && sha256sum *.apk > SHA256SUMS.txt) 2>/dev/null || true
 
