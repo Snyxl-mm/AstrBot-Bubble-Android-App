@@ -1067,6 +1067,8 @@ fi
         'export SNOWLUMA_WEBUI_PORT=${ServicePorts.snowLumaWebUiPort}; '
         'export SNOWLUMA_VNC_PORT=${ServicePorts.snowLumaVncPort}; '
         'export SNOWLUMA_ONEBOT_WS_PORT=${ServicePorts.snowLumaOneBotWsPort}; '
+        // AstrBot 的 aiocqhttp 只做反向 WS 服务端，SnowLuma 需要主动连它的端口
+        'export SNOWLUMA_ASTRBOT_WS_PORT=${ServicePorts.oneBotWsPort}; '
         'export SNOWLUMA_GITHUB_PROXY=${_shellSingleQuote(EnvironmentConfig.githubProxy)}; ';
   }
 

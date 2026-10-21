@@ -40,6 +40,9 @@ SL_VNC_PORT="${SNOWLUMA_VNC_PORT:-6081}"
 SL_VNCSERVER_PORT="${SNOWLUMA_VNCSERVER_PORT:-5900}"
 SL_ONEBOT_WS_PORT="${SNOWLUMA_ONEBOT_WS_PORT:-3001}"
 SL_ONEBOT_HTTP_PORT="${SNOWLUMA_ONEBOT_HTTP_PORT:-3000}"
+# AstrBot 的 aiocqhttp 适配器只做「反向 WS 服务端」（默认 6199），协议端必须主动连它。
+SL_ASTRBOT_WS_PORT="${SNOWLUMA_ASTRBOT_WS_PORT:-6199}"
+SL_ASTRBOT_WS_URL="${SNOWLUMA_ASTRBOT_WS_URL:-ws://127.0.0.1:${SL_ASTRBOT_WS_PORT}/ws}"
 SL_DISPLAY_NUM="${SNOWLUMA_DISPLAY_NUM:-21}"
 SL_SCREEN="${SNOWLUMA_SCREEN:-1280x720x24}"
 SL_PROXY_CFG="${SNOWLUMA_GITHUB_PROXY:-auto}"
@@ -260,7 +263,7 @@ install_snowluma() {
 
 write_config() {
   mkdir -p "$SL_HOME/config"
-  SNOW_BIND_HOST="$SL_BIND_HOST" \
+  SNOW_BIND_HOST="$SL_BIND_HOST" SNOW_ASTRBOT_WS_URL="$SL_ASTRBOT_WS_URL" \
     SNOW_WEBUI_PORT="$SL_WEBUI_PORT" SNOW_WS_PORT="$SL_ONEBOT_WS_PORT" \
     SNOW_HTTP_PORT="$SL_ONEBOT_HTTP_PORT" SNOW_TOKEN_FILE="$SL_RT/onebot-token" \
     SNOW_CONFIG_DIR="$SL_HOME/config" "$SL_HOME/node" -e '
@@ -299,6 +302,17 @@ const adapter = (name, port) => ({
   reportSelfMessage: false,
 });
 
+const astrbotUrl = process.env.SNOW_ASTRBOT_WS_URL || "ws://127.0.0.1:6199/ws";
+const wsClient = {
+  name: "astrbot",
+  enabled: true,
+  url: astrbotUrl,
+  role: "Universal",
+  accessToken: "",
+  messageFormat: "array",
+  reportSelfMessage: false,
+  reconnectIntervalMs: 5000,
+};
 let onebot = null;
 try { onebot = JSON.parse(fs.readFileSync(onebotPath, "utf8")); } catch {}
 
@@ -308,7 +322,7 @@ if (!onebot) {
       httpServers: [adapter("http-default", wantHttpPort)],
       httpClients: [],
       wsServers: [{ ...adapter("ws-default", wantWsPort), role: "Universal" }],
-      wsClients: [],
+      wsClients: [wsClient],
     },
     musicSignUrl: "",
   };
@@ -324,6 +338,15 @@ if (!onebot) {
   if (http0) http0.port = wantHttpPort;
   const ws0 = (nets.wsServers || [])[0];
   if (ws0) ws0.port = wantWsPort;
+
+  if (!Array.isArray(nets.wsClients)) nets.wsClients = [];
+  const mine = nets.wsClients.find((c) => c && c.name === "astrbot");
+  if (mine) {
+    mine.url = astrbotUrl;
+    mine.enabled = true;
+  } else {
+    nets.wsClients.push({ ...wsClient });
+  }
 }
 fs.writeFileSync(onebotPath, JSON.stringify(onebot, null, 2));
 
@@ -346,12 +369,21 @@ for (const f of accountFiles) {
   if (h0) h0.port = wantHttpPort;
   const w0 = (nets.wsServers || [])[0];
   if (w0) w0.port = wantWsPort;
+  if (!Array.isArray(nets.wsClients)) nets.wsClients = [];
+  const mineAcc = nets.wsClients.find((c) => c && c.name === "astrbot");
+  if (mineAcc) {
+    mineAcc.url = astrbotUrl;
+    mineAcc.enabled = true;
+  } else {
+    nets.wsClients.push({ ...wsClient });
+  }
   fs.writeFileSync(fp, JSON.stringify(cfg, null, 2));
   console.log("patched account config: " + f);
 }
 console.log("onebot bind=" + bind + " http=" + wantHttpPort + " ws=" + wantWsPort);
 ' || { warn "写入 SnowLuma 配置失败"; return 1; }
-  log "监听 $SL_BIND_HOST — WebUI $SL_WEBUI_PORT / OneBot WS $SL_ONEBOT_WS_PORT / OneBot HTTP $SL_ONEBOT_HTTP_PORT"
+  log "监听 $SL_BIND_HOST — WebUI $SL_WEBUI_PORT / OneBot WS $SL_ONEBOT_WS_PORT / HTTP $SL_ONEBOT_HTTP_PORT"
+  log "反向连接 AstrBot: $SL_ASTRBOT_WS_URL"
 }
 
 # QQ silently hot-patches itself, which breaks version-matched native hooks.
@@ -608,6 +640,7 @@ cmd_status() {
   printf 'webui_url=%s\n' "http://127.0.0.1:$SL_WEBUI_PORT/"
   printf 'vnc_url=%s\n' "http://127.0.0.1:$SL_VNC_PORT/vnc.html"
   printf 'onebot_url=%s\n' "ws://127.0.0.1:$SL_ONEBOT_WS_PORT/"
+  printf 'astrbot_ws_url=%s\n' "$SL_ASTRBOT_WS_URL"
   printf 'onebot_token=%s\n' "$token"
   printf 'display=%s\n' ":$SL_DISPLAY_NUM"
   printf 'pid=%s\n' "$(pid_of snowluma 2>/dev/null || echo 0)"

@@ -2562,11 +2562,17 @@ class _LauncherPageState extends State<LauncherPage>
       _showSnack('未找到 OneBot token，请先启动一次 SnowLuma');
       return;
     }
-    final url = ServicePorts.snowLumaOneBotWsUrl;
+    // AstrBot 用反向 WS（SnowLuma 主动连 AstrBot，已自动配好）；
+    // 正向 WS 留给 NoneBot / 其他 OneBot v11 客户端。
+    final forward = ServicePorts.snowLumaOneBotWsUrl;
+    final reverse = 'ws://127.0.0.1:${ServicePorts.oneBotWsPort}/ws';
     await Clipboard.setData(
-      ClipboardData(text: '$url?access_token=$token'),
+      ClipboardData(
+        text: '正向 WS（NoneBot 等）：$forward?access_token=$token\n'
+            '反向 WS（AstrBot，已自动配置）：$reverse',
+      ),
     );
-    _showSnack('已复制：$url?access_token=****');
+    _showSnack('已复制两种连接方式（AstrBot 用反向 WS，无需手动填）');
   }
 
   Future<void> _showSnowLumaUninstallDialog() async {
