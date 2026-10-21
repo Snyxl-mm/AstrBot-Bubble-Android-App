@@ -65,9 +65,18 @@ jobs:
           echo "--- gradle wrapper:"; grep distributionUrl android/gradle/wrapper/gradle-wrapper.properties
           echo "--- plugins:"; grep -E "com\\.android\\.application|kotlin\\.android" android/settings.gradle
 
-      # 可选：配置 release 签名。在仓库 Settings → Secrets 里放好
-      # KEYSTORE_BASE64 / STORE_PASSWORD / KEY_PASSWORD / KEY_ALIAS 即生效；
-      # 不配置时 build.gradle 会自动回退到 debug 签名，APK 依然可直接安装。
+      # 签名策略（按优先级）：
+      #   1) 仓库 Secrets 里的 KEYSTORE_BASE64（自己长期保管的 keystore）
+      #   2) Actions 缓存里的固定 keystore —— 首次构建生成，之后一直复用
+      #   3) 都没有时回退 debug 签名（每次运行 key 都不同，无法覆盖安装！）
+      # 走 1) 或 2) 才能保证多次构建用的是同一把签名密钥，可以覆盖安装。
+      - name: Restore signing keystore (cache)
+        id: keystore-cache
+        uses: actions/cache@v4
+        with:
+          path: android/app/release.jks
+          key: astrbot-release-keystore-v1
+
       - name: Prepare release keystore
         env:
           KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
@@ -75,18 +84,32 @@ jobs:
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
           KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
         run: |
+          JKS=android/app/release.jks
+          PASS=astrbot2026bubble
+          ALIAS=astrbot
           if [ -n "${KEYSTORE_BASE64}" ]; then
-            echo "配置 release 签名"
-            echo "${KEYSTORE_BASE64}" | base64 -d > android/app/release.jks
-            cat > android/key.properties <<EOF
-          storePassword=${STORE_PASSWORD}
-          keyPassword=${KEY_PASSWORD}
-          keyAlias=${KEY_ALIAS}
+            echo "签名：仓库 Secrets 中的 keystore"
+            echo "${KEYSTORE_BASE64}" | base64 -d > "$JKS"
+            SP="${STORE_PASSWORD}"; KP="${KEY_PASSWORD}"; AL="${KEY_ALIAS}"
+          elif [ -f "$JKS" ]; then
+            echo "签名：Actions 缓存中的固定 keystore（与上次构建一致，可覆盖安装）"
+            SP="$PASS"; KP="$PASS"; AL="$ALIAS"
+          else
+            echo "签名：首次运行，生成固定 keystore 并写入 Actions 缓存"
+            keytool -genkeypair -v -keystore "$JKS" -alias "$ALIAS" \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -storepass "$PASS" -keypass "$PASS" \
+              -dname "CN=AstrBot Bubble, OU=Personal, O=Personal, L=Local, ST=Local, C=CN"
+            SP="$PASS"; KP="$PASS"; AL="$ALIAS"
+          fi
+          cat > android/key.properties <<EOF
+          storePassword=${SP}
+          keyPassword=${KP}
+          keyAlias=${AL}
           storeFile=release.jks
           EOF
-          else
-            echo "未配置 keystore，回退 debug 签名"
-          fi
+          echo "--- 签名证书指纹（多次构建应保持一致）---"
+          keytool -list -v -keystore "$JKS" -storepass "${SP}" | grep -E "SHA256:" || true
 
       - name: Pub get
         run: flutter pub get
