@@ -276,6 +276,7 @@ install_snowluma() {
   SL_ARCHIVE=""
   need_dirs
   install_deps || return 1
+  ensure_linuxqq || warn "LinuxQQ 未就绪，扫码登录会失败（可稍后重跑 install）"
   download_release || return 1
   [ -n "$SL_ARCHIVE" ] || { warn "未取得安装包"; return 1; }
 
@@ -458,6 +459,154 @@ grant_ptrace() {
   fi
 }
 
+# ------------------------------------------------------------------ LinuxQQ --
+# SnowLuma 要 hook 真实的 QQ 客户端，所以 QQ 必须在本机可用。
+# 逻辑移植自 AstrBot 共享安装脚本：官方配置解析 → 签名 URL 回退 → deb 校验。
+linuxqq_ready() {
+  if command -v qq >/dev/null 2>&1 || [ -x /opt/QQ/qq ]; then
+    return 0
+  fi
+  dpkg-query -W -f='${Status}\n' linuxqq 2>/dev/null | grep -qx 'install ok installed'
+}
+
+linuxqq_download_url() {
+  local config_url="https://cdn-go.cn/qq-web/im.qq.com_new/latest/rainbow/linuxConfig.js"
+  local config="$TMPDIR/linuxqq-config.js"
+  local normalized="$TMPDIR/linuxqq-config-normalized.js"
+  local url="${SNOWLUMA_LINUXQQ_URL:-}"
+
+  if [ -n "$url" ]; then
+    printf '%s\n' "$url"
+    return 0
+  fi
+  curl -fL --connect-timeout 15 --max-time 60 "$config_url" -o "$config" || return 1
+  sed 's#\\/#/#g' "$config" > "$normalized"
+  url="$(grep -Eo "(https?:)?//[^\"'[:space:]]+" "$normalized" \
+        | grep -Ei '(arm64|aarch64)[^[:space:]]*\.deb([?#][^[:space:]]*)?' | head -n 1)"
+  case "$url" in
+    //*) url="https:$url" ;;
+  esac
+  case "$url" in
+    https://*.deb|https://*.deb\?*) printf '%s\n' "$url" ;;
+    *) return 1 ;;
+  esac
+}
+
+get_linuxqq_signed_url() {
+  local bare_url="$1"
+  local response="$TMPDIR/linuxqq-sign.json"
+  local normalized="$TMPDIR/linuxqq-sign-normalized.json"
+  SNOWLUMA_LINUXQQ_SIGNED_URL=""
+  if ! curl -fL --connect-timeout 15 --max-time 30 \
+    -A 'Mozilla/5.0 (X11; Linux aarch64) AppleWebKit/537.36 Chrome/124 Safari/537.36' \
+    -e 'https://im.qq.com/' \
+    -H 'Accept: application/json, text/plain, */*' \
+    -H 'Content-Type: application/json' \
+    -H 'x-oidb: {"uint32_command":"0x9b8e","uint32_service_type":1}' \
+    --data "$(printf '{\"url\":\"%s\"}' "$bare_url")" \
+    'https://im.qq.com/http2rpc/gotrpc/noauth/trpc.qqntv2.urlsign.UrlSign/GetSign' \
+    -o "$response"; then
+    return 1
+  fi
+  sed 's#\\/#/#g; s#\\u0026#\&#g; s#\\u003d#=#g' "$response" > "$normalized"
+  SNOWLUMA_LINUXQQ_SIGNED_URL="$(grep -Eo '"url"[[:space:]]*:[[:space:]]*"[^"]+"' "$normalized" \
+    | head -n 1 | sed -E 's/^"url"[[:space:]]*:[[:space:]]*"//; s/"$//')"
+  case "$SNOWLUMA_LINUXQQ_SIGNED_URL" in
+    https://*.deb|https://*.deb\?*) return 0 ;;
+    *) SNOWLUMA_LINUXQQ_SIGNED_URL=""; return 1 ;;
+  esac
+}
+
+validate_linuxqq_deb() {
+  local file="$1" arch pkg
+  [ -s "$file" ] || return 1
+  dpkg-deb --info "$file" >/dev/null 2>&1 || return 1
+  arch="$(dpkg-deb -f "$file" Architecture 2>/dev/null)"
+  pkg="$(dpkg-deb -f "$file" Package 2>/dev/null)"
+  case "$arch" in arm64|aarch64) ;; *) return 1 ;; esac
+  [ "$pkg" = "linuxqq" ]
+}
+
+download_qq_file() {
+  curl -fL --progress-bar -C - --connect-timeout 20 --max-time 900 \
+    -A 'Mozilla/5.0 (X11; Linux aarch64) AppleWebKit/537.36 Chrome/124 Safari/537.36' \
+    -e 'https://im.qq.com/' "$1" -o "$2"
+}
+
+# 等待态：已装则直接返回；否则装依赖 + 下 deb + dpkg 安装
+ensure_linuxqq() {
+  local deb="$SL_RT/linuxqq.deb" part="$SL_RT/linuxqq.deb.part"
+  local url sound_package
+
+  if linuxqq_ready; then
+    log "LinuxQQ 已就绪"
+    return 0
+  fi
+
+  log "安装 LinuxQQ（SnowLuma 需要真实 QQ 客户端）"
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get -o Acquire::ForceIPv4=true update || warn "apt-get update 失败，继续尝试"
+  if apt-cache show libasound2t64 >/dev/null 2>&1; then
+    sound_package=libasound2t64
+  else
+    sound_package=libasound2
+  fi
+  apt-get -o Acquire::ForceIPv4=true install -y --no-install-recommends \
+    libnss3 libnspr4 libgbm1 libxshmfence1 libxdamage1 libdrm2 \
+    libxkbcommon0 fontconfig dbus-x11 xvfb "$sound_package" || return 1
+  # noble 起是 libgtk-3-0t64，老版本是 libgtk-3-0；都失败也只告警（QQ 多半仍能跑）
+  apt-get -o Acquire::ForceIPv4=true install -y --no-install-recommends libgtk-3-0 \
+    || apt-get -o Acquire::ForceIPv4=true install -y --no-install-recommends libgtk-3-0t64 \
+    || warn "libgtk-3 未安装，QQ 可能无法显示界面"
+
+  rm -f "$part"
+
+  # 1) 本地已有安装包（用户手动放 /sdcard/Download 也能直接复用）
+  local candidate
+  for candidate in "${SNOWLUMA_LINUXQQ_FILE:-}" "$HOME"/*.deb /sdcard/Download/*.deb /storage/emulated/0/Download/*.deb; do
+    [ -n "$candidate" ] && [ -f "$candidate" ] || continue
+    validate_linuxqq_deb "$candidate" || continue
+    log "复用本地安装包: $candidate"
+    cp -f "$candidate" "$part"
+    break
+  done
+
+  # 2) 上游镜像（AstrBot 官方脚本仓把 QQ deb 托管在 release 里，国内可走代理）
+  if [ ! -s "$part" ]; then
+    resolve_proxy
+    local mirror
+    mirror="$(github_url 'https://github.com/MuFengDR/AstrBot-Android-Scripts/releases/latest/download/linuxqq-arm64.deb')"
+    log "下载 LinuxQQ（上游镜像，约 200 MB，带进度条；断流会自动续传）"
+    if ! download_qq_file "$mirror" "$part" || ! validate_linuxqq_deb "$part"; then
+      warn "上游镜像失败，回退官方直链"
+      rm -f "$part"
+    fi
+  fi
+
+  # 3) 官方直链 → 签名 URL 回退
+  if [ ! -s "$part" ]; then
+    if ! url="$(linuxqq_download_url)"; then
+      warn "未能解析 LinuxQQ arm64 安装包地址"
+      return 1
+    fi
+    log "下载 LinuxQQ: $(basename "${url%%\?*}")"
+    if ! download_qq_file "$url" "$part" || ! validate_linuxqq_deb "$part"; then
+      log "官方直链失败（常见 403），尝试签名 URL 回退"
+      if ! get_linuxqq_signed_url "$url" || ! download_qq_file "$SNOWLUMA_LINUXQQ_SIGNED_URL" "$part"; then
+        rm -f "$part"
+        warn "LinuxQQ 下载失败。可手动下载 deb 放到 /sdcard/Download/ 后重跑 install"
+        return 1
+      fi
+    fi
+  fi
+  validate_linuxqq_deb "$part" || { rm -f "$part"; warn "LinuxQQ 安装包校验失败"; return 1; }
+  mv -f "$part" "$deb"
+  apt-get -o Acquire::ForceIPv4=true install -y --allow-downgrades "$deb" || return 1
+  rm -f "$deb"
+  linuxqq_ready || { warn "LinuxQQ 安装后仍不可用"; return 1; }
+  log "LinuxQQ 安装完成"
+}
+
 # ------------------------------------------------------------------ start ----
 port_open() {
   local port="$1"
@@ -630,7 +779,15 @@ cmd_qq() {
       [ -x "$candidate" ] && { qq_bin="$candidate"; break; }
     done
   fi
-  [ -n "$qq_bin" ] || die "未找到 LinuxQQ，请先在环境管理里安装 NapCat 步骤（会顺带装 QQ）"
+  if [ -z "$qq_bin" ]; then
+    log "未找到 LinuxQQ，先尝试安装"
+    ensure_linuxqq || die "LinuxQQ 安装失败，可重跑: bash /root/snowluma.sh install"
+    for candidate in /opt/QQ/qq /usr/bin/qq /usr/local/bin/qq; do
+      [ -x "$candidate" ] && { qq_bin="$candidate"; break; }
+    done
+    qq_bin="${qq_bin:-$(command -v qq || true)}"
+    [ -n "$qq_bin" ] || die "LinuxQQ 安装后仍找不到可执行文件"
+  fi
 
   start_xvfb || return 1
   export DISPLAY=":${SL_DISPLAY_NUM}"
@@ -678,6 +835,7 @@ cmd_status() {
   printf 'installed=%s\n' "$installed"
   printf 'running=%s\n' "$running"
   printf 'qq_running=%s\n' "$qq_up"
+  printf 'linuxqq_ready=%s\n' "$(linuxqq_ready && echo 1 || echo 0)"
   printf 'version=%s\n' "$SL_VERSION"
   printf 'home=%s\n' "$SL_HOME"
   printf 'bind_host=%s\n' "$SL_BIND_HOST"
