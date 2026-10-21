@@ -31,6 +31,8 @@
 set -o pipefail
 
 SL_VERSION="${SNOWLUMA_VERSION:-2.0.3}"
+# Bumped whenever the controller itself changes, so `status` proves which copy is live.
+SL_SCRIPT_REV="rev3-xvfb-recovery"
 SL_HOME="${SNOWLUMA_DIR:-$HOME/snowluma}"
 SL_RT="${SNOWLUMA_RUNTIME_DIR:-$HOME/.config/astrbot-android/snowluma}"
 SL_INSTANCE_HOME="${SNOWLUMA_QQ_HOME:-$HOME/snowluma_instances/default_home}"
@@ -642,32 +644,100 @@ ensure_fluxbox_font() {
   done
 }
 
-start_xvfb() {
-  local lock="/tmp/.X${SL_DISPLAY_NUM}-lock"
-  mkdir -p /tmp/.X11-unix
-  chmod 1777 /tmp/.X11-unix 2>/dev/null || true
-  if [ -S "/tmp/.X11-unix/X${SL_DISPLAY_NUM}" ]; then
-    log "Xvfb :${SL_DISPLAY_NUM} 已在运行"
-  else
-    rm -f "$lock" "/tmp/.X11-unix/X${SL_DISPLAY_NUM}" 2>/dev/null || true
-    nohup Xvfb ":${SL_DISPLAY_NUM}" -screen 0 "$SL_SCREEN" +extension GLX +render \
-      > "$SL_LOG_DIR/xvfb.log" 2>&1 &
-    record_pid xvfb "$!"
-    local i
-    for i in $(seq 1 50); do
-      [ -S "/tmp/.X11-unix/X${SL_DISPLAY_NUM}" ] && break
-      sleep 0.1
-    done
-    [ -S "/tmp/.X11-unix/X${SL_DISPLAY_NUM}" ] || { warn "Xvfb 启动失败"; cat "$SL_LOG_DIR/xvfb.log" 2>/dev/null; return 1; }
-  fi
-  export DISPLAY=":${SL_DISPLAY_NUM}"
+x_display_alive() {
+  command -v xdpyinfo >/dev/null 2>&1 || return 1
+  timeout 5 xdpyinfo -display ":${SL_DISPLAY_NUM}" >/dev/null 2>&1
+}
 
+x_lock_pid() {
+  local f="/tmp/.X${SL_DISPLAY_NUM}-lock"
+  [ -s "$f" ] || return 1
+  tr -cd '0-9' < "$f"
+}
+
+# A live X server can be evidenced two ways: our own pid file, or the pid the
+# server left in /tmp/.X<n>-lock. The lock file is the authoritative one — the
+# pid file goes stale whenever stop_pid never ran.
+x_proc_alive() {
+  local p comm
+  for p in "$(pid_of xvfb 2>/dev/null || true)" "$(x_lock_pid 2>/dev/null || true)"; do
+    [ -n "$p" ] || continue
+    comm="$(cat "/proc/$p/comm" 2>/dev/null || true)"
+    case "$comm" in Xvfb|X|Xorg) return 0 ;; esac
+  done
+  return 1
+}
+
+# A Xvfb that was killed (or whose PTY session went away) leaves /tmp/.X<n>-lock
+# and the display socket behind. The next launch then aborts with "server already
+# running" (the lock file names a live pid) and everything above it —
+# fluxbox/x11vnc/noVNC/QQ — silently stays dead. A server that is alive but has
+# lost its socket is just as useless: no new client can attach. Either way the
+# only repair is to clear the display and start over.
+clear_stale_x() {
+  local p
+  for p in $(pgrep -f "(^|/)Xvfb :${SL_DISPLAY_NUM}( |$)" 2>/dev/null); do
+    kill "$p" 2>/dev/null || true
+    sleep 0.3
+    kill -9 "$p" 2>/dev/null || true
+  done
+  local lock_pid
+  lock_pid="$(x_lock_pid 2>/dev/null || true)"
+  if [ -n "$lock_pid" ] && kill -0 "$lock_pid" 2>/dev/null; then
+    kill -9 "$lock_pid" 2>/dev/null || true
+  fi
+  rm -f "/tmp/.X${SL_DISPLAY_NUM}-lock" "/tmp/.X11-unix/X${SL_DISPLAY_NUM}" 2>/dev/null || true
+}
+
+start_fluxbox() {
+  export DISPLAY=":${SL_DISPLAY_NUM}"
   ensure_fluxbox_font
   if ! is_running fluxbox; then
     nohup fluxbox > "$SL_LOG_DIR/fluxbox.log" 2>&1 &
     record_pid fluxbox "$!"
     sleep 0.5
   fi
+}
+
+start_xvfb() {
+  local lock="/tmp/.X${SL_DISPLAY_NUM}-lock"
+  local sock="/tmp/.X11-unix/X${SL_DISPLAY_NUM}"
+  local attempt i
+  mkdir -p /tmp/.X11-unix
+  chmod 1777 /tmp/.X11-unix 2>/dev/null || true
+
+  if [ -S "$sock" ] && { x_proc_alive || x_display_alive; }; then
+    log "Xvfb :${SL_DISPLAY_NUM} 已在运行"
+  else
+    if [ -S "$sock" ] || [ -f "$lock" ]; then
+      warn "X 显示 :${SL_DISPLAY_NUM} 处于残破状态（锁/套接字残留），清理后重启"
+    fi
+    clear_stale_x
+    sleep 0.5
+    for attempt in 1 2 3; do
+      rm -f "$lock" "$sock" 2>/dev/null || true
+      nohup Xvfb ":${SL_DISPLAY_NUM}" -screen 0 "$SL_SCREEN" +extension GLX +render -nolisten tcp \
+        > "$SL_LOG_DIR/xvfb.log" 2>&1 &
+      record_pid xvfb "$!"
+      for i in $(seq 1 60); do
+        [ -S "$sock" ] && is_running xvfb && break
+        sleep 0.1
+      done
+      [ -S "$sock" ] && is_running xvfb && break
+      warn "Xvfb :${SL_DISPLAY_NUM} 第 ${attempt} 次启动失败"
+      tail -n 8 "$SL_LOG_DIR/xvfb.log" 2>/dev/null || true
+      clear_stale_x
+      sleep 1
+    done
+    if ! { [ -S "$sock" ] && is_running xvfb; }; then
+      warn "Xvfb 启动失败（已重试 3 次），日志: $SL_LOG_DIR/xvfb.log"
+      cat "$SL_LOG_DIR/xvfb.log" 2>/dev/null || true
+      return 1
+    fi
+    log "Xvfb :${SL_DISPLAY_NUM} 已就绪"
+  fi
+
+  start_fluxbox
   return 0
 }
 
@@ -733,8 +803,23 @@ start_snowluma() {
   return 1
 }
 
+# The app can fire two subcommands back to back (e.g. 打开 WebUI auto-starting
+# the stack while the user taps 启动 QQ). Two Xvfb racing for :21 is exactly the
+# "server already running" failure, so serialize the control commands.
+take_ctl_lock() {
+  local lockfile="$SL_RT/.ctl.lock"
+  # NB: no `2>/dev/null` here — redirections on a bare `exec` are applied to
+  # this shell for good, which would silence every later message.
+  exec 9>>"$lockfile" || return 0
+  if command -v flock >/dev/null 2>&1; then
+    flock -w 120 9 >/dev/null 2>&1 || true
+  fi
+  return 0
+}
+
 cmd_start() {
   need_dirs
+  take_ctl_lock
   [ -f "$SL_HOME/index.mjs" ] || die "SnowLuma 未安装，先运行: bash $0 install"
   start_xvfb || return 1
   start_vnc || return 1
@@ -746,12 +831,15 @@ cmd_start() {
 }
 
 cmd_stop() {
+  need_dirs
+  take_ctl_lock
+  stop_pid qq
   stop_pid snowluma
   stop_pid novnc
   stop_pid x11vnc
   stop_pid fluxbox
   stop_pid xvfb
-  rm -f "/tmp/.X${SL_DISPLAY_NUM}-lock" "/tmp/.X11-unix/X${SL_DISPLAY_NUM}" 2>/dev/null || true
+  clear_stale_x
   log "SnowLuma 已停止"
 }
 
@@ -763,6 +851,7 @@ cmd_restart() {
 
 cmd_vnc() {
   need_dirs
+  take_ctl_lock
   start_xvfb || return 1
   start_vnc || return 1
   log "扫码页面: http://127.0.0.1:$SL_VNC_PORT/vnc.html"
@@ -772,6 +861,7 @@ cmd_vnc() {
 # single-instance lock, so it must not share HOME with the NapCat instances.
 cmd_qq() {
   need_dirs
+  take_ctl_lock
   local qq_bin token mode
   qq_bin="${SL_QQ_BIN:-}"
   if [ -z "$qq_bin" ]; then
@@ -790,12 +880,16 @@ cmd_qq() {
   fi
 
   start_xvfb || return 1
+  # The QR code lives on the X display, so the noVNC side has to be up first:
+  # otherwise QQ starts fine and the user still sees nothing at :6081.
+  start_vnc || true
   export DISPLAY=":${SL_DISPLAY_NUM}"
   mkdir -p "$SL_INSTANCE_HOME/.config" "$SL_INSTANCE_HOME/.cache" "$SL_INSTANCE_HOME/.local/share"
 
   mode="$SL_HOOK_MODE"
   [ "$mode" = "auto" ] && mode="inject"  # upstream path; "preload" is experimental
 
+  : > "$SL_LOG_DIR/qq.log"
   log "启动 QQ 实例: HOME=$SL_INSTANCE_HOME DISPLAY=:$SL_DISPLAY_NUM 注入模式=$mode"
   if [ "$mode" = "preload" ]; then
     local so="$SL_HOME/native/snowluma-linux-arm64.so"
@@ -809,7 +903,7 @@ cmd_qq() {
       SNOWLUMA_HOOK_STUB_START=1 \
       SNOWLUMA_HOOK_SERVICE_MODE=1 \
       LD_PRELOAD="$so" \
-      "$qq_bin" --no-sandbox --disable-gpu ) >> "$SL_LOG_DIR/qq.log" 2>&1 &
+      "$qq_bin" --no-sandbox --disable-gpu --disable-dev-shm-usage ) >> "$SL_LOG_DIR/qq.log" 2>&1 &
     record_pid qq "$!"
   else
     ( cd "$SL_INSTANCE_HOME" && exec env \
@@ -819,10 +913,24 @@ cmd_qq() {
       XDG_DATA_HOME="$SL_INSTANCE_HOME/.local/share" \
       SNOWLUMA_HOOK_RUNTIME_DIR="$SL_RUN_DIR" \
       XDG_RUNTIME_DIR="$SL_RUN_DIR" \
-      "$qq_bin" --no-sandbox --disable-gpu ) >> "$SL_LOG_DIR/qq.log" 2>&1 &
+      "$qq_bin" --no-sandbox --disable-gpu --disable-dev-shm-usage ) >> "$SL_LOG_DIR/qq.log" 2>&1 &
     record_pid qq "$!"
   fi
-  log "QQ 已拉起，扫码请打开 http://127.0.0.1:$SL_VNC_PORT/vnc.html"
+
+  # QQ used to die inside proot within a couple of seconds while the script
+  # happily reported success. Watch it for a while instead of guessing.
+  local j
+  sleep 3
+  for j in $(seq 1 8); do
+    is_running qq || break
+    sleep 1
+  done
+  if ! is_running qq; then
+    warn "QQ 启动后立刻退出（最近日志 $SL_LOG_DIR/qq.log）:"
+    tail -n 40 "$SL_LOG_DIR/qq.log" 2>/dev/null || true
+    return 1
+  fi
+  log "QQ 已拉起 (pid $(pid_of qq))，扫码请打开 http://127.0.0.1:$SL_VNC_PORT/vnc.html"
 }
 
 cmd_status() {
@@ -837,6 +945,7 @@ cmd_status() {
   printf 'qq_running=%s\n' "$qq_up"
   printf 'linuxqq_ready=%s\n' "$(linuxqq_ready && echo 1 || echo 0)"
   printf 'version=%s\n' "$SL_VERSION"
+  printf 'script_rev=%s\n' "$SL_SCRIPT_REV"
   printf 'home=%s\n' "$SL_HOME"
   printf 'bind_host=%s\n' "$SL_BIND_HOST"
   printf 'webui_port=%s\n' "$SL_WEBUI_PORT"
@@ -854,7 +963,54 @@ cmd_status() {
 
 cmd_logs() {
   need_dirs
-  tail -n "${2:-60}" "$SL_LOG_DIR/snowluma.log" 2>/dev/null || die "暂无日志"
+  local target="${2:-snowluma}" lines="${3:-60}" file
+  case "$target" in
+    ''|*[!0-9]*) ;;
+    *) lines="$target"; target="snowluma" ;;
+  esac
+  case "$target" in
+    qq) file="$SL_LOG_DIR/qq.log" ;;
+    vnc|x11vnc) file="$SL_LOG_DIR/x11vnc.log" ;;
+    novnc) file="$SL_LOG_DIR/novnc.log" ;;
+    xvfb|x) file="$SL_LOG_DIR/xvfb.log" ;;
+    fluxbox) file="$SL_LOG_DIR/fluxbox.log" ;;
+    *) file="$SL_LOG_DIR/snowluma.log" ;;
+  esac
+  [ -f "$file" ] || die "暂无日志: $file"
+  log "== $file =="
+  tail -n "$lines" "$file"
+}
+
+# One-shot troubleshooting dump: what is up, what is not, and why.
+cmd_diag() {
+  need_dirs
+  local name pid i
+  printf '=== status ===\n'
+  cmd_status
+  printf '\n=== display :%s ===\n' "$SL_DISPLAY_NUM"
+  ls -l "/tmp/.X${SL_DISPLAY_NUM}-lock" "/tmp/.X11-unix/X${SL_DISPLAY_NUM}" 2>&1 || true
+  printf '\n=== pids ===\n'
+  for name in qq snowluma xvfb fluxbox x11vnc novnc; do
+    pid="$(pid_of "$name" 2>/dev/null || true)"
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+      printf '%-9s pid=%s alive\n' "$name" "$pid"
+    else
+      printf '%-9s dead/absent\n' "$name"
+    fi
+  done
+  printf '\n=== stray Xvfb ===\n'
+  pgrep -af "Xvfb" 2>/dev/null || printf '(none)\n'
+  printf '\n=== listening ports ===\n'
+  (ss -ltnp 2>/dev/null || netstat -ltnp 2>/dev/null) \
+    | grep -E ':(5099|6081|5900|3000|3001|6199)\b' || printf '(none of 5099/6081/5900/3000/3001/6199)\n'
+  printf '\n=== linuxqq ===\n'
+  ls -l /opt/QQ/qq 2>&1 || true
+  linuxqq_ready && printf 'linuxqq_ready=1\n' || printf 'linuxqq_ready=0\n'
+  printf '\n=== logs (tail) ===\n'
+  for name in xvfb fluxbox x11vnc novnc qq snowluma; do
+    printf -- '--- %s ---\n' "$name"
+    tail -n 12 "$SL_LOG_DIR/$name.log" 2>/dev/null || printf '(no log)\n'
+  done
 }
 
 cmd_uninstall() {
@@ -879,6 +1035,9 @@ Usage: snowluma.sh <command>
   qq                   启动独立 QQ 实例（登录扫码用）
   vnc                  只重启扫码（noVNC）部分
   logs [n]             查看 SnowLuma 日志
+  logs qq|vnc|novnc|xvfb|fluxbox [n]
+                       查看指定组件日志
+  diag                 一键诊断（状态 + 端口 + 各组件日志末尾）
   uninstall [--clean-data]
 EOF
 }
@@ -894,6 +1053,7 @@ main() {
     qq) cmd_qq ;;
     vnc) cmd_vnc ;;
     logs) cmd_logs "$@" ;;
+    diag) cmd_diag ;;
     uninstall) shift; cmd_uninstall "${1:-}" ;;
     help|--help|-h|'') usage ;;
     *) usage; exit 2 ;;
