@@ -118,6 +118,10 @@ class HomeController extends GetxController {
   final RxBool isOpenCodeInstalled = false.obs;
   final RxBool isSnowLumaRunning = false.obs;
   final RxBool isSnowLumaInstalled = false.obs;
+  final RxBool isSnowLumaQqRunning = false.obs;
+  final RxBool isSnowLumaWebUiReady = false.obs;
+  final RxBool isSnowLumaVncReady = false.obs;
+  final RxBool isLinuxQqReady = false.obs;
   final RxBool initialPasswordAssistanceCompleted = false.obs;
   final RxString homeBackgroundPath = ''.obs;
   final RxDouble cardGlassOpacity = 0.62.obs;
@@ -1195,23 +1199,52 @@ fi
     }
   }
 
-  /// Reads the pid file written by snowluma.sh and checks it from the host:
-  /// proot processes are children of the app, so /proc/<pid> is visible.
-  Future<bool> refreshSnowLumaRunning() async {
+  int? _readSnowLumaPid(String name) {
     try {
-      final pidFile = File('$snowLumaRuntimePath/pids/snowluma.pid');
-      if (!await pidFile.exists()) {
-        isSnowLumaRunning.value = false;
-        return false;
-      }
-      final pid = int.tryParse((await pidFile.readAsString()).trim()) ?? 0;
-      final alive = pid > 0 && await Directory('/proc/$pid').exists();
-      isSnowLumaRunning.value = alive;
-      return alive;
-    } catch (e) {
-      Log.e('读取 SnowLuma 运行状态失败: $e', tag: 'SnowLuma');
-      return isSnowLumaRunning.value;
+      final file = File('$snowLumaRuntimePath/pids/$name.pid');
+      if (!file.existsSync()) return null;
+      return int.tryParse(file.readAsStringSync().trim());
+    } catch (_) {
+      return null;
     }
+  }
+
+  Future<bool> _isPidAlive(int? pid) async {
+    if (pid == null || pid <= 0) return false;
+    // proot 进程是 App 的子进程，host 侧 /proc/<pid> 可见
+    return Directory('/proc/$pid').exists();
+  }
+
+  /// 一次性刷新 SnowLuma 的全部运行态（进程 + 端口 + QQ），供卡片状态区使用。
+  Future<void> refreshSnowLumaStatus() async {
+    try {
+      final snowLumaAlive = await _isPidAlive(_readSnowLumaPid('snowluma'));
+      final qqAlive = await _isPidAlive(_readSnowLumaPid('qq'));
+      final hasInstall = await File(
+        '$ubuntuPath/root/snowluma/index.mjs',
+      ).exists();
+      final linuxQq = await File('/opt/QQ/qq').exists() ||
+          await File('$ubuntuPath/opt/QQ/qq').exists();
+      var webUiReady = false;
+      var vncReady = false;
+      if (snowLumaAlive) {
+        webUiReady = !await _isPortAvailable(ServicePorts.snowLumaWebUiPort);
+        vncReady = !await _isPortAvailable(ServicePorts.snowLumaVncPort);
+      }
+      isSnowLumaInstalled.value = hasInstall;
+      isSnowLumaRunning.value = snowLumaAlive;
+      isSnowLumaQqRunning.value = qqAlive;
+      isSnowLumaWebUiReady.value = webUiReady;
+      isSnowLumaVncReady.value = vncReady;
+      isLinuxQqReady.value = linuxQq;
+    } catch (e) {
+      Log.e('刷新 SnowLuma 状态失败: $e', tag: 'SnowLuma');
+    }
+  }
+
+  Future<bool> refreshSnowLumaRunning() async {
+    await refreshSnowLumaStatus();
+    return isSnowLumaRunning.value;
   }
 
   Future<void> checkInstallerUpdate({

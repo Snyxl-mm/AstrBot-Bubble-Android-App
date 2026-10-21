@@ -38,6 +38,7 @@ class _LauncherPageState extends State<LauncherPage>
   final Map<String, int> _botBindingRefreshVersions = {};
   final Set<String> _runningNapCatIds = {};
   Worker? _napCatInstancesWorker;
+  Timer? _snowLumaStatusTimer;
   bool _checkingEnvironment = false;
   bool _initialEnvironmentCheckComplete = false;
   Object? _initialEnvironmentError;
@@ -80,11 +81,17 @@ class _LauncherPageState extends State<LauncherPage>
       _refreshAllBotBindingStates();
       homeController.refreshInitialPasswordAssistanceState();
     });
+    // 卡片状态每 3 秒自更新：进程、端口、QQ、以及安装完成后的自动出现
+    _snowLumaStatusTimer = Timer.periodic(const Duration(seconds: 3), (_) {
+      if (!mounted) return;
+      homeController.refreshSnowLumaStatus();
+    });
   }
 
   @override
   void dispose() {
     _napCatInstancesWorker?.dispose();
+    _snowLumaStatusTimer?.cancel();
     WidgetsBinding.instance.removeObserver(this);
     super.dispose();
   }
@@ -2423,6 +2430,36 @@ class _LauncherPageState extends State<LauncherPage>
               ),
             ],
           ),
+          const SizedBox(height: 8),
+          Obx(() {
+            final running = homeController.isSnowLumaRunning.value;
+            final webUi = homeController.isSnowLumaWebUiReady.value;
+            final vnc = homeController.isSnowLumaVncReady.value;
+            final qq = homeController.isSnowLumaQqRunning.value;
+            return Wrap(
+              spacing: 6,
+              runSpacing: 6,
+              crossAxisAlignment: WrapCrossAlignment.center,
+              children: [
+                _snowLumaStatusPill(
+                  running ? Colors.green : Colors.grey,
+                  running ? '运行中' : '已停止',
+                ),
+                _snowLumaStatusPill(
+                  webUi ? Colors.green : Colors.grey,
+                  'WebUI ${ServicePorts.snowLumaWebUiPort}',
+                ),
+                _snowLumaStatusPill(
+                  vnc ? Colors.green : Colors.grey,
+                  '扫码 ${ServicePorts.snowLumaVncPort}',
+                ),
+                _snowLumaStatusPill(
+                  qq ? Colors.green : Colors.orange,
+                  qq ? 'QQ 运行中' : 'QQ 未启动',
+                ),
+              ],
+            );
+          }),
           const SizedBox(height: 12),
           Row(
             children: [
@@ -2456,14 +2493,51 @@ class _LauncherPageState extends State<LauncherPage>
           Row(
             children: [
               Expanded(
+                child: Obx(() => _homeButton(
+                      context: context,
+                      onPressed: _launchSnowLumaQq,
+                      icon: const Icon(Icons.qr_code_2),
+                      label: Text(homeController.isLinuxQqReady.value
+                          ? '启动 QQ'
+                          : '安装并启动 QQ'),
+                    )),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
                 child: _homeButton(
                   context: context,
                   onPressed: _openSnowLumaVnc,
-                  icon: const Icon(Icons.qr_code_2),
-                  label: const Text('扫码登录（noVNC）'),
+                  icon: const Icon(Icons.desktop_windows_outlined),
+                  label: const Text('扫码页'),
                 ),
               ),
             ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _snowLumaStatusPill(Color color, String text) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: 0.10),
+        borderRadius: BorderRadius.circular(20),
+        border: Border.all(color: color.withValues(alpha: 0.22)),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(Icons.circle, size: 9, color: color),
+          const SizedBox(width: 5),
+          Text(
+            text,
+            style: TextStyle(
+              fontSize: 12,
+              fontWeight: FontWeight.w600,
+              color: color,
+            ),
           ),
         ],
       ),
@@ -2528,7 +2602,17 @@ class _LauncherPageState extends State<LauncherPage>
 
   Future<void> _openSnowLumaWebUi() async {
     if (!homeController.isSnowLumaRunning.value) {
-      _showSnack('请先启动 SnowLuma');
+      // 一键启动：未运行就先拉起，再把终端切过去看进度
+      _showSnack('SnowLuma 未运行，正在启动…');
+      try {
+        await homeController.startSnowLuma(onCommandDone: () {
+          _refreshEnvironmentStatus();
+        });
+        widget.onNavigate?.call(2);
+        _showSnack('启动中，就绪后再点一次「打开 WebUI」');
+      } catch (e) {
+        _showSnack('启动失败：$e');
+      }
       return;
     }
     _showSnack('正在等待 SnowLuma WebUI 就绪');
@@ -2543,7 +2627,16 @@ class _LauncherPageState extends State<LauncherPage>
 
   Future<void> _openSnowLumaVnc() async {
     if (!homeController.isSnowLumaRunning.value) {
-      _showSnack('请先启动 SnowLuma');
+      _showSnack('SnowLuma 未运行，正在启动…');
+      try {
+        await homeController.startSnowLuma(onCommandDone: () {
+          _refreshEnvironmentStatus();
+        });
+        widget.onNavigate?.call(2);
+        _showSnack('启动中，就绪后再点一次「扫码页」');
+      } catch (e) {
+        _showSnack('启动失败：$e');
+      }
       return;
     }
     _showSnack('正在等待 noVNC 就绪');
